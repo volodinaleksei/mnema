@@ -765,9 +765,13 @@ def api_mark_segment_voice_mix(rid: int, seg_id: int):
         if seg.excluded:
             raise HTTPException(409, "фрагмент уже исключён")
         seg.speaker_source = "voice_mix"
+        seg.speaker_name = None  # hint-имя до mix: под него нельзя писать двух людей
         seg.needs_review = False
         s.add(SessionEvent(job_id=r.job_id, event="segment_mixed",
                            detail=f"фрагмент {seg.id} (кластер {r.cluster_label})"))
+        # closure-критерий отличается от exclude: здесь закрываем, когда не осталось
+        # фрагментов, ЖДУЩИХ решения (needs_review), а не когда кластер опустел, —
+        # именные фрагменты кластера остаются в нём и в стенограмме
         waiting = s.scalars(select(Segment).where(
             Segment.job_id == r.job_id,
             Segment.speaker_id == r.cluster_label,

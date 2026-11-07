@@ -120,6 +120,21 @@ def test_fail_if_room_busy_free_room_noop(db, fake_redis):
         assert s.get(Job, new_id).status == "scheduled"
 
 
+def test_fail_if_room_busy_swallows_db_error(db, fake_redis, monkeypatch):
+    """Sboy BDD pri perehode v failed: isklyuchenie ne lonit scheduler,
+    no zapusk vsyo ravno gasitsya (True, bez push)."""
+    from mnema.core import jobs_launch
+
+    def boom(*a, **k):
+        raise RuntimeError("BDD nedostupna")
+
+    monkeypatch.setattr("mnema.core.pipeline.transition", boom)
+    _mk_job("111", "recording")
+    new_id = _mk_job("111", "scheduled")
+    assert jobs_launch.fail_if_room_busy(new_id) is True
+    assert [k for (k, _) in fake_redis.pushes] == []
+
+
 def test_fail_if_room_busy_kill_switch_off(db, fake_redis, monkeypatch):
     monkeypatch.setenv("ROOM_BUSY_GATE", "0")
     from mnema.core import jobs_launch

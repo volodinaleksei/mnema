@@ -896,6 +896,22 @@ def test_mix_segment_marks_voice_mix_keeps_cluster_pending(client):
         assert seg.excluded is False
 
 
+def test_mix_segment_clears_hint_name(client):
+    """Mix fragmentsa s hint-imenem: imya snyato — pod nim dva cheloveka."""
+    from mnema.core.db import get_session
+    from mnema.core.models import Segment
+    jid, rid, _s1, s2 = _make_two_segment_cluster(client)
+    with get_session() as s:
+        seg = s.get(Segment, s2)
+        seg.speaker_name = "Sidorov S. S."  # kak posle verdicta hint
+        s.commit()
+    assert client.post(f"/api/reviews/{rid}/segments/{s2}/mix").status_code == 200
+    with get_session() as s:
+        seg = s.get(Segment, s2)
+        assert seg.speaker_source == "voice_mix"
+        assert seg.speaker_name is None
+
+
 def test_mix_last_pending_segment_closes_review_as_mixed_and_resumes(client,
                                                                      monkeypatch):
     """Posledniy utochnyaemyy fragment pomечён mikssom — review zakryvaetsya

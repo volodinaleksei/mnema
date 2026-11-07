@@ -238,6 +238,34 @@ def test_voice_mix_segment_stays_unnamed_on_auto(db, monkeypatch):
         assert seg.speaker_name is None and seg.needs_review is False
 
 
+def test_voice_mix_stays_unnamed_when_answer_is_mixed(db):
+    """Otvet operatora na klaster s voice_mix: imya ne prisvaivaetsya miksu,
+    no drugie fragmenty klastera ego poluchayut."""
+    from mnema.core.db import get_session
+    from mnema.core.models import Job, ReviewRequest, Segment
+    from mnema.core.speaker import apply_review_answer
+    with get_session() as s:
+        s.add(Job(id=26, topic="t", status="awaiting_review", source="upload"))
+        rv = ReviewRequest(job_id=26, cluster_label="S0", status="pending")
+        s.add(rv)
+        s.add(Segment(job_id=26, speaker_id="S0", diar_label="S0", t_start=0,
+                      t_end=5, text="miks", speaker_source="voice_mix",
+                      speaker_name="Sidorov S. S.", needs_review=False))
+        s.add(Segment(job_id=26, speaker_id="S0", diar_label="S0", t_start=6,
+                      t_end=9, text="odin golos", speaker_source="unresolved",
+                      needs_review=True))
+        s.commit()
+        rid = rv.id
+    apply_review_answer(rid, None, "Ivanov I. I.", False, "web")
+    with get_session() as s:
+        mix = s.scalars(select(Segment).where(
+            Segment.job_id == 26, Segment.text == "miks")).first()
+        solo = s.scalars(select(Segment).where(
+            Segment.job_id == 26, Segment.text == "odin golos")).first()
+        assert mix.speaker_name is None and mix.speaker_source == "voice_mix"
+        assert solo.speaker_name == "Ivanov I. I."
+
+
 def test_run_speaker_does_not_reopen_mixed_review(db, monkeypatch):
     """Zakrytyy kak mixed review povtornoy matsching ne prevrashchaet v pending."""
     from mnema.core.db import get_session

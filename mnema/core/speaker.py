@@ -252,6 +252,7 @@ def apply_review_answer(rid: int, employee_id: int | None, employee_name: str | 
                 Segment.job_id == job_id, Segment.speaker_id == cluster)).all():
             if seg.speaker_source == "voice_mix":
                 seg.needs_review = False
+                seg.speaker_name = None  # pod miksom dva cheloveka — imya ne derzhim
                 continue
             if seg.speaker_source == "multi_voice":
                 seg.needs_review = True

@@ -618,6 +618,7 @@ def _run_speaker(job_id: int) -> None:
                     # operator skazal: mikss dvuh golosov — imya ne prisvaivaem,
                     # v embedding ne berem, na review bolshe ne vynosim
                     seg.needs_review = False
+                    seg.speaker_name = None  # hint-imya do pometski: dva golosa, nyudy
                     continue
                 if seg.speaker_source == "multi_voice":
                     # v fragmente dva golosa: imya ne prisvaivaem, v embedding

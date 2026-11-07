@@ -149,7 +149,10 @@ if guard_should_stop "\$SRV_RC" "${FORCE_DEPLOY:-0}"; then
         echo "ERROR: pered force-recreate ne udalos' proverit' zapisi (rc=\$SRV_RC) — stop." >&2
     fi
     printf '%s\n' "\$SRV_LIST" >&2
-    echo "Povtorite s FORCE_DEPLOY=1 tol'ko esli uvareny, cto zhivykh zapisey net." >&2
+    echo "VNI MANIE: repo na serve uzhe obnoven (git reset --hard) i alembic" >&2
+    echo "uzhe podnyat — konteinery poka rabotayut na STAROM obraze, eto bezopasno." >&2
+    echo "Dokanchivajte zapisi i povtorite deploy: novele reset ne nuzhen, dostatochno" >&2
+    echo "sborki i up -d (ili FORCE_DEPLOY=1, esli uvareny, cto zhivykh zapisey net)." >&2
     exit 1
 fi
 

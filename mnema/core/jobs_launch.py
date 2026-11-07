@@ -71,6 +71,11 @@ def fail_if_room_busy(job_id: int) -> bool:
                          f"({busy_status}) — второй агент не заходит")
     except ValueError:
         pass  # status uzhe smenilsya (napimer cancelled) — push vs ravno ne nuzhen
+    except Exception:  # noqa: BLE001 — sboy BDD pri perehode: ne lonim scheduler,
+        import logging    # no i ne pishem v ochered' (agent vsyo ravno ne nuzhen)
+        logging.getLogger("mnema.jobs_launch").exception(
+            "room_busy: ne udalos' pometit' job %s failed (zanyat vstrechey %s)",
+            job_id, busy_id)
     return True
 
 

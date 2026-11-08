@@ -23,23 +23,73 @@ QUEUES = {
 }
 
 
+def _start_heartbeat() -> None:
+    """Molotok zhivosti worker na obshchem /data dlya docker-healthcheck:
+    main-protsess (a ne horse) trogaet fayl kazhdy 30 s. Esli konteyner
+    zyblitsa/pribit, molotok molchit i healthcheck perekluchaet v unhealthy."""
+    import threading
+    import time
+
+    path = os.environ.get("WORKER_HEARTBEAT_FILE", "/data/worker.heartbeat")
+
+    def tick() -> None:
+        while True:
+            try:
+                with open(path, "w") as f:
+                    f.write(str(int(time.time())))
+            except OSError as e:
+                log.warning("worker heartbeat write failed: %s", e)
+            time.sleep(30)
+
+    threading.Thread(target=tick, name="worker-heartbeat", daemon=True).start()
+
+
 def run_worker() -> None:
     names = [q.strip() for q in os.environ.get(
         "WORKER_QUEUES", "asr,speaker,structure").split(",") if q.strip()]
     r = Redis.from_url(redis_url())
     conc = max(1, int(os.environ.get("WORKER_CONCURRENCY", "2") or 2))
     log.info("rq worker start: queues=%s procs=%s", names, conc)
+    _start_heartbeat()
     import multiprocessing as mp
     kids = [mp.Process(target=_worker_loop, args=(names,), daemon=True)
             for _ in range(conc - 1)]
     for k in kids:
         k.start()
     _start_scheduler(r, names)
+    _start_kid_supervisor(kids, names)
     try:
         _worker_loop(names)
     finally:
         for k in kids:
             k.terminate()
+
+
+def _start_kid_supervisor(kids: list, names: list[str]) -> None:
+    """M13: esli odin iz horse'ov umer (OOM-killer, RQ-bug), to eshe tihe
+    propadaet — ocheredi narastaют, no roditel' ob etom ne znaet. Sledim i
+    perezapuskaem umershikh; shutdov (terminatsiya v finally) ostanavlivает
+    nadzyatelya, ibo on daemon."""
+    import threading
+    import time as _time
+
+    def supervise() -> None:
+        while True:
+            _time.sleep(30)
+            for i, k in enumerate(kids):
+                if k.is_alive():
+                    continue
+                log.error("worker horse #%d umer (exit=%s) — perezapuskaem",
+                          i, k.exitcode)
+                try:
+                    new = type(k)(target=_worker_loop, args=(names,), daemon=True)
+                    new.start()
+                    kids[i] = new
+                except Exception as e:  # noqa: BLE001 — ne lonit' nadzyatelya
+                    log.error("restart horse #%d failed: %s", i, e)
+
+    threading.Thread(target=supervise, name="rq-kid-supervisor",
+                     daemon=True).start()
 
 
 def _worker_loop(names: list[str]) -> None:

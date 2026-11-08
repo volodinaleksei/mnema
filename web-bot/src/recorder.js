@@ -18,7 +18,7 @@ import {
   JOINED_DOM_SEL, NO_AUDIO_SEL, IN_MEETING_SRC, verdictFromSignals,
   ENDED_MEETING_SRC,
 } from "./zoom_labels.js";
-import { cleanSingletonLocks, freshProfileCopy, profilesRoot, publicVncPort } from "./vnc_manager.js";
+import { freshProfileCopy, profilesRoot, publicVncPort } from "./vnc_manager.js";
 
 const log = createLogger("recorder");
 
@@ -109,9 +109,16 @@ export async function launchAndRecord(jobId, cfg, holder, onEvent, vnc = null) {
       fs.mkdirSync(profilesRoot(), { recursive: true });
       freshProfileCopy(cfg.zoomProfileDir, profileDir);
     } catch (e) {
+      // Ranshe pri etom degradirovali na cfg.zoomProfileDir: snimali
+      // SingletonLock i zapuskali VTORoy Chromium na tom zhe bazovom profile,
+      // gde uzhe zhil setup-brauzer (vnc_manager). Dva Chromium na odnom
+      // profile = korrupt profil'a (poterya Zoom-logina vsey sistemy).
+      // No-tishogo degradirovaniya net: failim zadau, dannye zapisi eshche
+      // ne nachalis', postStatus('failed') razberyotsya.
       log.error(`job ${jobId}: profile copy:`, e.message);
-      profileDir = cfg.zoomProfileDir; // degradaciya: legasiy obshchiy profil'
-      cleanSingletonLocks(cfg.zoomProfileDir);
+      return { ok: false, fail_reason: "profile_copy_failed",
+               error: `ne udalos' sozdat' kopiyu profilya dlya headless-zapisi: ${e.message}. Bazovyy profil' zanyat setup-brauzerom; perezapustite setup-brauzer ili osvobodite disk.`,
+               screenshot_path: null };
     }
   }
   const webmPath = path.join(jobDir, "raw.webm");
@@ -148,6 +155,12 @@ export async function launchAndRecord(jobId, cfg, holder, onEvent, vnc = null) {
     state.stopRequested = true;
     state.stopReason = reason || "stop";
   };
+  // stop mog priyti vo vremya zapuska brauzera (requestStop eshche ne byl
+  // naznachen) — soobschenie ostanavlivat' ne dolzhno propast'
+  if (holder.pendingStop) {
+    state.stopRequested = true;
+    state.stopReason = holder.pendingStop;
+  }
 
   await page.addInitScript(INIT_SCRIPT);
 
@@ -218,8 +231,15 @@ export async function launchAndRecord(jobId, cfg, holder, onEvent, vnc = null) {
     }
     return rec.acked;
   };
+  let flushing = false;
   const flushTimer = setInterval(async () => {
     if (!recording) return;
+    // re-entrancy: esli predydushchiy flush eshche idet (mnogo freymov,
+    // bol'shiy payload, zanyataya stranitsa) — propustit' tik, a ne drenit'
+    // te zhe neackanye chanki paralel'no (dvoynaya CDP-serializaciya,
+    // sgony ack-granits, dubli v chunksSaved)
+    if (flushing) return;
+    flushing = true;
     let gotAny = false;
     try {
       let tracks = 0;
@@ -312,6 +332,8 @@ export async function launchAndRecord(jobId, cfg, holder, onEvent, vnc = null) {
         onEvent(EVENT.CHUNKS_SAVED, `сохранено байт: ${state.chunksSaved}`);
     } catch (e) {
       onEvent(EVENT.ERROR, `flush: ${e.message}`);
+    } finally {
+      flushing = false;
     }
   }, cfg.chunkFlushMs);
 
@@ -843,11 +865,24 @@ async function waitForLeaveButton(page, deadlineMs, onEvent = () => {}) {
 // reCAPTCHA na knopke Join reshaet tol'ko chelovek (§12, kadptcha). Zhdёm
 // vruchnuyu prokhoda cherez individual'nyy noVNC vstrechi: signal + odnorazovyy
 // alert so ssylkoy na ekrannyy slot, do CAPTCHA_WAIT_MIN.
-let captchaAlerted = false;
+// #7: ranshe eto byl vechnyy latch (`captchaAlerted=true` navsegda): pervaya
+// vstrecha s kapchoy glusila alerty vseh posledyushchih, i operator nikogda
+// ne uznaval o novykh zaprosah. Rate-limit (odin alert na CAPTCHA_ALERT_COOLDOWN)
+// sohranyaet zamysel anti-flood, no pozvolyaet signalyat' snova.
+let captchaAlertTs = 0;
+function captchaAlertAllowed() {
+  const cooldownMin = parseInt(process.env.CAPTCHA_ALERT_COOLDOWN_MIN || "60", 10);
+  const cd = Number.isFinite(cooldownMin) && cooldownMin > 0 ? cooldownMin : 60;
+  const now = Date.now();
+  if (now - captchaAlertTs < cd * 60000) return false;
+  captchaAlertTs = now;
+  return true;
+}
 async function waitForLeaveOrCaptcha(page, deadlineMs, cfg, onEvent, vnc = null) {
   const waitMs = (cfg.captchaWaitMin || 15) * 60 * 1000;
   const capUntil = Math.min(deadlineMs, Date.now() + waitMs);
   let sawCaptcha = false;
+  let waitingSignaled = false;
   while (Date.now() < capUntil) {
     const v = await classifyPage(page);
     if (v === "joined") return true;
@@ -855,15 +890,28 @@ async function waitForLeaveOrCaptcha(page, deadlineMs, cfg, onEvent, vnc = null)
       // tuslyar mog ostavatsya skrytym — budit UI i perklassifikiryuem
       if (await classifyJoined(page, () => {})) return true;
     }
-    if (v === "captcha") {
+    // #19: posle popytki Join host mog postavit' v waiting-room; eto ne
+    // kapcha i ne terminal, no zhid' vsyo CAPTCHA_WAIT_MIN eshe slepeye,
+    // chem zhdat kapchu: signalyat' odin raz i prodolzhat' (operator v kurse).
+    if (v === "waiting_room") {
+      if (!waitingSignaled) {
+        waitingSignaled = true;
+        onEvent("waiting_room",
+          "Zoom: вы в зале ожидания — ведите встречу вручную или отмените");
+        if (captchaAlertAllowed())
+          alertOperator("Бот в зале ожидания Zoom",
+            "Бот попал в зал ожидания (waiting room) — хост не пускает. " +
+            (vnc ? `Запустите его через noVNC :${publicVncPort(cfg, vnc.slot)} ` : "") +
+            "или отмените запись. Встреча не начнётся автоматически.");
+      }
+    } else if (v === "captcha") {
       if (!sawCaptcha) {
         sawCaptcha = true;
         if (vnc) {
           const portHint = String(publicVncPort(cfg, vnc.slot));
           onEvent("captcha",
             `reCAPTCHA на Join — нужен ручной проход через noVNC :${portHint}`);
-          if (!captchaAlerted) {
-            captchaAlerted = true;
+          if (captchaAlertAllowed()) {
             alertOperator("reCAPTCHA при входе в встречу",
               `Откройте noVNC :${portHint} (Connect) и пройдите капчу в окне Zoom. ` +
               `Автоматизация капчи запрещена (§12).`);
@@ -875,8 +923,7 @@ async function waitForLeaveOrCaptcha(page, deadlineMs, cfg, onEvent, vnc = null)
           onEvent("captcha",
             "reCAPTCHA на Join, но индивидуальный экран VNC нет (слотов не хватило" +
             " или отказ стека) — запись идёт headless, капчу пройти нечем");
-          if (!captchaAlerted) {
-            captchaAlerted = true;
+          if (captchaAlertAllowed()) {
             alertOperator("reCAPTCHA без VNC-экрана",
               "Встреча столкнулась с reCAPTCHA, но свободных VNC-слотов нет " +
               "(или не поднялся дисплей): запись идёт headless и продолжится " +

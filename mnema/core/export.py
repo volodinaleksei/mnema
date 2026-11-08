@@ -346,6 +346,21 @@ def _needs_protocols(job: Job, proto: Protocol | None) -> bool:
     return False
 
 
+def _retry_window_cutoff() -> dt.datetime:
+    """Okno retraev po created_ts: nesmyeslivat' tysyachi arhivnyh `done` job
+    kazhdye 5 minut (DB-scan + CIFS stat v kazhdom `_needs_audio`). Zadaschiki
+    so sboyom SMB vyshyat MAX_ATTEMPTS bystro; starshe okna schitaem
+    zabvshennymi (povernut' vypyruchku mozhno ruchnym export). OVERRIDE:
+    EXPORT_RETRY_DAYS (0 = bez okna)."""
+    try:
+        days = float(os.environ.get("EXPORT_RETRY_DAYS", "60") or 60)
+    except ValueError:
+        days = 60.0
+    if days <= 0:
+        return dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    return dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+
+
 def retry_pending_exports(limit: int = RETRY_BATCH) -> int:
     """Maintenance-ретраи: недовыгруженные job (attempts < MAX_ATTEMPTS).
 
@@ -353,11 +368,13 @@ def retry_pending_exports(limit: int = RETRY_BATCH) -> int:
     по dedup_key). Возвращает число успешных выгрузок за проход."""
     if not export_configured():
         return 0
+    cutoff = _retry_window_cutoff()
     candidates: list[tuple[int, bool, bool]] = []
     exhausted: list[Job] = []
     with get_session() as s:
         for job in s.scalars(select(Job).where(
-                Job.status.in_(EXPORT_RETRY_STATUSES))).all():
+                Job.status.in_(EXPORT_RETRY_STATUSES),
+                Job.created_ts >= cutoff)).all():
             ej = job.export_json or {}
             if int(ej.get("attempts") or 0) >= MAX_ATTEMPTS:
                 exhausted.append(job)

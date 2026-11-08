@@ -132,6 +132,34 @@ def snap_boundary(segs: list, t: float, window_s: float = 120.0) -> float:
     return ordered[best[1] + 1].t_start
 
 
+def _rebase_child_asr_json(s, child_id: int, b: float, hi: float) -> None:
+    """Parts v asr_json potomka: roditel'skie absolqutnyye `s`/`e` -> lokal'nyye
+    shkaly childa (minus b, obrezka k [0, hi-b]). Pustye posle obrizki parts
+    sbrasyvaemsya v None (togda segment idet kak celaya repika bez razbivki)."""
+    segs = s.scalars(select(Segment).where(
+        Segment.job_id == child_id, Segment.asr_json.isnot(None))).all()
+    lo_lim, hi_lim = 0.0, max(0.0, hi - b)
+    for seg in segs:
+        if not seg.asr_json:
+            continue
+        rebased = []
+        for p in seg.asr_json:
+            try:
+                ps = float(p.get("s", 0)) - b
+                pe = float(p.get("e", 0)) - b
+            except (TypeError, ValueError):
+                continue
+            ps = max(lo_lim, ps)
+            pe = min(hi_lim, pe)
+            if pe - ps <= 0.01:
+                continue
+            q = dict(p)
+            q["s"] = round(ps, 3)
+            q["e"] = round(pe, 3)
+            rebased.append(q)
+        seg.asr_json = rebased or None
+
+
 def _clip_turns(turns: list | None, lo: float, hi: float) -> list | None:
     """Диа-turns диапазона [lo, hi) с реbase в локальное время части."""
     if not turns:
@@ -353,6 +381,11 @@ def split_job(job_id: int) -> list[int]:
                           .values(job_id=cid,
                                   t_start=Segment.t_start - b,
                                   t_end=Segment.t_end - b))
+                # H2: asr_json.parts хранyat absolqutnyye taimstAMPy roditelya;
+                # ih nado perestavit' na shkaly potomka (-b) i ogranichit' [0, hi-b].
+                # Inache coalesce/phrase-resort dayut repiki za predelami diar turns
+                # i nevertyye t_start pri klike v pleere.
+                _rebase_child_asr_json(s, cid, b, hi)
                 s.commit()
             child_ids.append(cid)
             # 7b: пресет этапов-предков — иначе stages потомка вечно показывают

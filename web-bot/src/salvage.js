@@ -12,12 +12,58 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { shortMixWarningS, filterUsableSegs, ebmlHeaderOffsets, mixWorseThanInput, pickBestDecoded, MIN_SEGMENT_BYTES, silentOutputReason, pickFallbackSeg, coverageBaseBytes, currentRunSegs } from "./seg_key.js";
+import { shortMixWarningS, filterUsableSegs, ebmlHeaderOffsets, mixWorseThanInput, pickBestDecoded, MIN_SEGMENT_BYTES, silentOutputReason, pickFallbackSeg, coverageBaseBytes, currentRunSegs, EBML_MAGIC } from "./seg_key.js";
 import { decodedAudioSeconds, reencodeWebm } from "./webm_fix.js";
 import { parseRawSegName } from "./record_guard.js";
 
 const execFileP = promisify(execFile);
 const ERROR = "error";
+
+// #6: atomarnaya kopiya — pishem v tmp i peremeshchaem. Ranshe pryamoy
+// copyFileSync na crash-e ostavlyal obrezanny webmPath, kotoryy salvage
+// potom priznavalsya «uzhe finalize» (proverka size>0) i propuskal peresborku,
+// kogda syryye uzhe udaleny. #13: poiski EBML-magic bez zagruzki vseho fayla
+// v RAM (6-h zazpis' ~170 MB/segment -> OOM v konteeynerom limite).
+function copyAtomic(src, dst) {
+  const tmp = `${dst}.tmp.${process.pid}`;
+  fs.copyFileSync(src, tmp);
+  fs.renameSync(tmp, dst);
+}
+
+function ebmlOffsetsStream(p) {
+  // Poiski vseh EBML-magic v fayle bez zagruzki vsego fayla v RAM. Klasicheskiy
+  // overlap-poisk: carry = poslednie (MAGIC_LEN-1) baytov predidushchego chunka;
+  // kazhdaya nakhodka vklyuchaet >= 1 novykh baytov, poetomu ne dubliroysya.
+  const SCAN = 8 * 1024 * 1024;
+  const carryMax = EBML_MAGIC.length - 1;
+  const offs = [];
+  const fd = fs.openSync(p, "r");
+  try {
+    let pos = 0;
+    let carry = Buffer.alloc(0);
+    for (;;) {
+      const chunk = Buffer.allocUnsafe(SCAN);
+      const r = fs.readSync(fd, chunk, 0, SCAN, pos);
+      if (r <= 0) break;
+      const buf = carry.length ? Buffer.concat([carry, chunk.subarray(0, r)])
+                               : chunk.subarray(0, r);
+      const base = pos - carry.length; // absolyutnyy put' dlya buf[0]
+      let i = 0;
+      for (;;) {
+        i = buf.indexOf(EBML_MAGIC, i);
+        if (i < 0) break;
+        offs.push(base + i);
+        i += EBML_MAGIC.length;
+      }
+      carry = Buffer.from(chunk.subarray(Math.max(0, r - carryMax), r));
+      pos += r;
+      if (r < SCAN) break;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return offs;
+}
 
 // ------------------------------------------------------------- finalize FT-6/41
 // segs: [{p, bytes, epochMs}] — po odnomu webm-potoku na freym-payplayn;
@@ -42,7 +88,7 @@ export async function finalize(jobId, segs, webmPath, wavPath, mp3Path, state, e
   for (const s of real) {
     let parts = [s];
     try {
-      const offs = ebmlHeaderOffsets(fs.readFileSync(s.p));
+      const offs = ebmlOffsetsStream(s.p);
       if (offs.length > 1) {
         onEvent(ERROR, `сегмент ${path.basename(s.p)}: склеено ${offs.length} потоков — режу по швам`);
         parts = [];
@@ -129,12 +175,25 @@ export async function finalize(jobId, segs, webmPath, wavPath, mp3Path, state, e
         onEvent(ERROR, `микс прочитался на ${Math.round(mixDec)} c из ${Math.round(bestDec)} c `
           + `— восстанавливаю реэнкодом фрагмента ${path.basename(bestSeg.p)}`);
     }
-    if (useFallback && await reencodeWebm(bestSeg.p, webmPath)) { /* gotovo */ }
-    else if (!useFallback && mixDec > 0) fs.renameSync(tmpMix, webmPath);
-    else if (fs.existsSync(tmpMix) && fs.statSync(tmpMix).size > 0) fs.renameSync(tmpMix, webmPath);
-    else {
+    if (useFallback) {
+      // miks otverzhen polnym dekodom (khuzhe luchshego fragmenta): itog —
+      // peresbor donorа. Esli reencode ne udalsya, otverzhenyy miks vse ravno
+      // NE prodvigaem (eto imenno tot skenary, ot kotorego zashishalis
+      // job 17/24) — berem atomarnuyu kopiyu naibolee krupnogo syrogo.
+      const donorOk = await reencodeWebm(bestSeg.p, webmPath);
+      if (!donorOk) {
+        onEvent(ERROR, "reencode donora ne udalsya — beru kopiyu krupneyshego syrogo fragmenta");
+        const biggest = [...inputs].sort((a, b) => b.bytes - a.bytes)[0];
+        if (biggest) { try { copyAtomic(biggest.p, webmPath); } catch { /* */ } }
+      }
+    } else if (mixDec > 0) {
+      fs.renameSync(tmpMix, webmPath);
+    } else if (fs.existsSync(tmpMix) && fs.statSync(tmpMix).size > 0) {
+      // dekod miksa ne udalsya (probe=0), no fayl nie pustom — posledniy shans
+      fs.renameSync(tmpMix, webmPath);
+    } else {
       const biggest = [...inputs].sort((a, b) => b.bytes - a.bytes)[0];
-      if (biggest) { try { fs.copyFileSync(biggest.p, webmPath); } catch { /* */ } }
+      if (biggest) { try { copyAtomic(biggest.p, webmPath); } catch { /* */ } }
     }
   } catch (e) {
     /* bolshe vsego potokov — beriem naibolee polnyy bez shkly */
@@ -243,8 +302,13 @@ export async function finalize(jobId, segs, webmPath, wavPath, mp3Path, state, e
   }
   for (const [k, p] of [["webm", webmPath], ["wav", wavPath], ["mp3", mp3Path]])
     if (fs.existsSync(p)) sizes[k] = fs.statSync(p).size;
+  // #5: ranshe vsegda `ok: true`, i pri otsutstvuyushchem/obrezannom itoge
+  // runTask otpравlyal finished s putyom v nie suschestvuyushchiy fayl (API
+  // pishet audio_files po etomu puti). ok = itog real'no na meste i nepustom.
+  const produced = fs.existsSync(webmPath) && fs.statSync(webmPath).size > 0;
   return {
-    ok: true, webm: webmPath, wav: wavOk ? wavPath : null,
+    ok: produced, fail_reason: produced ? undefined : "no_output",
+    webm: webmPath, wav: wavOk ? wavPath : null,
     mp3: mp3Ok ? mp3Path : null, duration_s: durationS, sizes,
     end_reason: (end && end.reason) || "salvage",
   };

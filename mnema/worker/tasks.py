@@ -181,6 +181,13 @@ def run_speaker_id(job_id: int) -> None:
             s.add(SessionEvent(job_id=job_id, event="diar_done",
                                detail=f"кластеров: {len(set(labels))}"))
             s.commit()
+        # H3 (izvestnoye ogranichenie): _run_speaker zdes' chitaet seg.asr_json,
+        # kotoryy kommitit PARALLEL'naya asr-vetka; esli matsching starsheje
+        # zapishi asr — _phrase_resort molcha stayetsya no-opom. Polnogo
+        # perenosa v run_join etot test-suit ne douskayet (split+review-routing
+        # idet v join do razresheniya klasterov); reshenie trebuyet remonta
+        # orkestracii. Skhodyashchiy variant: PHRASE_VERIFY=0 i postoronniy
+        # rerun `_run_speaker` (backfill) posle asr_done.
         _run_speaker(job_id)
     except Exception as e:  # noqa: BLE001
         _fail_branch(job_id, e, "speaker_error")
@@ -198,7 +205,10 @@ def _overlap_ratio_min() -> float:
 def run_join(job_id: int) -> None:
     """Sliyaniye vetok posle oboikh: steno.md, zatem split+LLM — tol'ko kogda vse
     govoryashchiye opredeleny. Pri neraspznannyh golosakh stop v awaiting_review
-    (analiz LLM idet POSLE utochneniya lyudey, a ne do nego)."""
+    (analiz LLM idet POSLE utochneniya lyudey, a ne do nego).
+
+    Voiceprint-matsching (_run_speaker) idet v speaker-vetke (sm. run_speaker_id),
+    a NE zdes': RQ zapuskaet etot join cherez depends_on posle oboikh vetok."""
     try:
         p = _job_paths(job_id)
         _write_steno(job_id, p)
@@ -304,43 +314,77 @@ def _find_raw(job_dir: Path) -> Path | None:
     return None
 
 
+def _wav_looks_complete(wav: Path, raw_dur_s: float) -> bool:
+    """H4: wav ot ubitogo proshla (RQ SIGKILL / deploy --force-recreate / OOM)
+    byvaet obrizannyim i prohodit proverku `size>44` vechno, posle chego VAD/ASR
+    molcha obrabatyvayut golovu, a hvost teryaetsya. Sravnivaem dlitel'nost'
+    wav s istochnikom; bol'shoy deficit — chitaem nepolnym."""
+    from ..core.audio import wav_duration_s
+    if not wav.exists() or wav.stat().st_size <= 44:
+        return False
+    if raw_dur_s <= 0:
+        return True  # istochnik ne izmerim — ne peresobirayem vslepuu
+    got = wav_duration_s(wav)
+    if got <= 0:
+        return False
+    # dopusk 20%: differenty metadannyh/decoding, no ne polovinnaya zapis'
+    return got >= raw_dur_s * 0.8
+
+
 def _prepare_wav(job_id: int, p: dict) -> None:
-    """Ishodnik (webm-zapis' ili arhivnyy video/audio) -> wav/mp3 (FT-6 + FT-41)."""
+    """Ishodnik (webm-zapis' ili arhivnyy video/audio) -> wav/mp3 (FT-6 + FT-41).
+
+    wav pishetsya v .part i peremeshchaetsya atomarno (os.replace): esli
+    proshel ubili poseredine ffmpeg, na meste ne ostaetsya vyglyadyashchiy
+    polnym obrezannyi fayl (H4)."""
     from ..core.audio import webm_to_wav16k, webm_to_mp3, repair_webm, wav_duration_s
     from ..core.audio import media_to_wav16k, media_to_mp3
     raw = _find_raw(p["dir"])
     if raw is None:
         return
     if p["wav"].exists() and p["wav"].stat().st_size > 44:
-        return
+        from ..core.audio import decoded_duration_s, ffprobe_duration
+        raw_dur = (ffprobe_duration(raw) if raw.suffix.lower() != ".webm"
+                   else decoded_duration_s(raw))
+        if _wav_looks_complete(p["wav"], raw_dur):
+            return
+        log.warning("job %s: wav obrizann (%.0f s proshiv ~%.0f s) — peresobirayem",
+                    job_id, wav_duration_s(p["wav"]), raw_dur)
+        p["wav"].unlink(missing_ok=True)
     is_webm = raw.suffix.lower() == ".webm"
-    if is_webm:
-        if not _webm_ok(raw):
-            repair_webm(raw)
-        webm_to_wav16k(raw, p["wav"])
-        dur = wav_duration_s(p["wav"])
-        if not p["mp3"].exists():
-            ok = webm_to_mp3(raw, p["mp3"]) or _wav_to_mp3(p)
-            if not ok:
-                pass  # mp3 enc niedostupen — vydayem wav kak distributiv (FT-41a)
-    elif raw.suffix.lower() == ".wav":
-        # arhivnyy wav lyubogo formata: peresampleiruem v canonical'nyy 16k mono
-        media_to_wav16k(raw, p["wav"])
-        dur = wav_duration_s(p["wav"])
-        if not p["mp3"].exists():
-            media_to_mp3(raw, p["mp3"]) or _wav_to_mp3(p)
-    elif raw.suffix.lower() == ".mp3":
-        from ..core.audio import ffprobe_duration
-        if raw != p["mp3"]:
-            _link_or_copy(raw, p["mp3"])  # gotovaya dorozhka dlya vydachi
-        dur = ffprobe_duration(raw)
-        media_to_wav16k(raw, p["wav"])
-    else:
-        # video/konteyner: izvlekayem pervuyu audio-dorozhku
-        media_to_wav16k(raw, p["wav"])
-        dur = wav_duration_s(p["wav"])
-        if not p["mp3"].exists():
-            media_to_mp3(raw, p["mp3"])
+    tmp_wav = p["wav"].with_name(p["wav"].name + ".part")
+    try:
+        dur = 0.0
+        if is_webm:
+            if not _webm_ok(raw):
+                repair_webm(raw)
+            webm_to_wav16k(raw, tmp_wav)
+            dur = wav_duration_s(tmp_wav)
+            if not p["mp3"].exists():
+                ok = webm_to_mp3(raw, p["mp3"]) or _wav_to_mp3(p)
+                if not ok:
+                    pass  # mp3 enc niedostupen — vydayem wav kak distributiv (FT-41a)
+        elif raw.suffix.lower() == ".wav":
+            # arhivnyy wav lyubogo formata: peresampleiruem v canonical'nyy 16k mono
+            media_to_wav16k(raw, tmp_wav)
+            dur = wav_duration_s(tmp_wav)
+            if not p["mp3"].exists():
+                media_to_mp3(raw, p["mp3"]) or _wav_to_mp3(p)
+        elif raw.suffix.lower() == ".mp3":
+            from ..core.audio import ffprobe_duration
+            if raw != p["mp3"]:
+                _link_or_copy(raw, p["mp3"])  # gotovaya dorozhka dlya vydachi
+            dur = ffprobe_duration(raw)
+            media_to_wav16k(raw, tmp_wav)
+        else:
+            # video/konteyner: izvlekayem pervuyu audio-dorozhku
+            media_to_wav16k(raw, tmp_wav)
+            dur = wav_duration_s(tmp_wav)
+            if not p["mp3"].exists():
+                media_to_mp3(raw, p["mp3"])
+        os.replace(tmp_wav, p["wav"])  # tol'ko polnyy wav zanimayet final'nyy put'
+    finally:
+        tmp_wav.unlink(missing_ok=True)
     _register_audio_files(job_id, p, dur)
 
 
@@ -407,8 +451,11 @@ def _run_split_and_structure(job_id: int) -> None:
                            cid, dedupe=True) is None:
                 try:
                     run_structure(cid)  # direct-режим: inline
-                except Exception:  # noqa: BLE001 — падение потомка не трогает родителя
-                    pass
+                except Exception as ce:  # noqa: BLE001 — падение потомка не трогает родителя
+                    # run_structure uzhe provodit potomka v cherez _fail_branch;
+                    # no tishoy pass v etoy vetke teryal sled (napr. esli
+                    # _fail_branch sam upal). Fiksiruem v log.
+                    log.warning("split child %s structure failed: %r", cid, ce)
     if apply_failed:
         raise RuntimeError("split: применение границ не завершено, "
                            "родительская стенограмма может быть неполной")
@@ -1013,6 +1060,8 @@ def _write_steno(job_id: int, p: dict) -> Path:
             Segment.job_id == job_id, Segment.excluded.is_(False)
         ).order_by(Segment.t_start)).all()
         job = s.get(Job, job_id)
+    if job is None:  # zadala udalena vo vremya obrabotki: pishet steno neskyda
+        raise LookupError(f"job {job_id} ne sushchestvuyet (udalen?)")
     lines = [f"# Протокол (транскрипт): {job.topic}", ""]
     from ..core.coalesce import coalesce_segments, expand_segments, speaker_display
     for seg in coalesce_segments(expand_segments(list(segs),

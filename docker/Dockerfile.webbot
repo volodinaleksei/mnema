@@ -5,8 +5,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY web-bot/package.json ./
-RUN npm install && npx playwright install --with-deps chromium
+COPY web-bot/package.json web-bot/package-lock.json ./
+# npm ci: reproducible-ustanovka po lockfile (ranshe npm install tyagel
+# noveyschie versii na kazhdom rebuild-e, i razvorovannyy tranzitivnyy
+# paket popadal by v obraz, kotoryy kidaet zhivyye Zoom-vstrechi)
+RUN npm ci && npx playwright install --with-deps chromium
 
 COPY web-bot/src ./src
 COPY templates ./templates

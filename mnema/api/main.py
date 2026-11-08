@@ -6,10 +6,11 @@ from __future__ import annotations
 
 import datetime as dt
 import os
-import subprocess
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -35,8 +36,33 @@ from ..core import uploads as uploads_svc
 from ..core import vnc as vnc_svc
 from ..core.tz import app_tz_label, fmt_local, local_to_utc, local_utc_offset, to_local
 
-app = FastAPI(title="Mnema", version="0.1.0")
 log = setup_logging("api")
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    errors = registry.preflight()
+    if errors:
+        for e in errors:
+            log.error("preflight error: %s", e)
+        raise SystemExit(1)
+    engine = get_engine()
+    Base.metadata.create_all(engine)  # dlya SQLite-starta; dalneye Alembic
+    try:
+        start_default_jobs()
+    except Exception as e:  # noqa: BLE001
+        log.error("scheduler start failed: %s", e)
+    try:
+        from ..core.scheduler import reschedule_missed_jobs
+        n = reschedule_missed_jobs()
+        if n:
+            log.info("rescheduled missed jobs: %s", n)
+    except Exception as e:  # noqa: BLE001
+        log.error("reschedule missed jobs failed: %s", e)
+    yield
+
+
+app = FastAPI(title="Mnema", version="0.1.0", lifespan=_lifespan)
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
@@ -93,28 +119,6 @@ templates.env.globals["local_utc_offset"] = local_utc_offset
 STATIC_DIR = Path(__file__).parent / "static"
 STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
-
-@app.on_event("startup")
-def startup() -> None:
-    errors = registry.preflight()
-    if errors:
-        for e in errors:
-            log.error("preflight error: %s", e)
-        raise SystemExit(1)
-    engine = get_engine()
-    Base.metadata.create_all(engine)  # dlya SQLite-starta; dalneye Alembic
-    try:
-        start_default_jobs()
-    except Exception as e:  # noqa: BLE001
-        log.error("scheduler start failed: %s", e)
-    try:
-        from ..core.scheduler import reschedule_missed_jobs
-        n = reschedule_missed_jobs()
-        if n:
-            log.info("rescheduled missed jobs: %s", n)
-    except Exception as e:  # noqa: BLE001
-        log.error("reschedule missed jobs failed: %s", e)
 
 
 # ----------------------------------------------------------------- REST (FT-21)
@@ -226,12 +230,27 @@ def api_job_status(jid: int, body: StatusIn):
                 raise HTTPException(404)
             j.join_attempts = body.attempts
             s.commit()
+    # ideal'nost' po status: retry posle сетевого таймаuta (web-bot uzhe
+    # dostavil) ne dolzhen davat' 409 — klient ne razlichaet 'uzhe primeneno'
+    # ot 'zapreshchennyy perekhod'. attempts primenen vyse tol'ko esli job
+    # sushchestvuyet; perekhod — nizhe.
+    with get_session() as s:
+        j = s.get(Job, jid)
+        if j is None:
+            raise HTTPException(404)
+        if j.status == body.status:
+            return {"ok": True, "status": body.status, "already": True}
+    from ..core.pipeline import TransitionRace
     try:
         transition(jid, body.status, fail_reason=body.fail_reason, error=body.error,
                    event=f"status:{body.status}",
                    screenshot_path=safe_screenshot_path(body.screenshot_path))
+    except TransitionRace as e:
+        raise HTTPException(409, str(e))
     except ValueError as e:
         raise HTTPException(409, str(e))
+    except KeyError:
+        raise HTTPException(404)
     return {"ok": True, "status": body.status}
 
 
@@ -276,7 +295,13 @@ def api_job_finished(jid: int, body: FinishedIn):
     _add("mp3", body.mp3_path)
     if already:
         return {"ok": True, "already": True}
-    transition(jid, "processing", event="recording_finished")
+    from ..core.pipeline import TransitionRace
+    try:
+        transition(jid, "processing", event="recording_finished")
+    except TransitionRace:
+        # paralel'nyy writer (cancel/finished retry) uzhe smenil status —
+        # eto ne 500, a shtatnoe "uzhe ne recording"
+        return {"ok": True, "already": True}
     if recoverable:
         with get_session() as s:
             s.add(SessionEvent(job_id=jid, event="recording_recovered",
@@ -284,9 +309,7 @@ def api_job_finished(jid: int, body: FinishedIn):
                                       "возвращена в processing"))
             s.commit()
     from ..core.queue import enqueue_job
-    processing_started = enqueue_job("asr", "mnema.worker.tasks.run_orchestrate", jid)
-    if not processing_started:
-        pass  # worker vzjanet sam po ocheredi statusov; v dev — run inline
+    enqueue_job("asr", "mnema.worker.tasks.run_orchestrate", jid)
     return {"ok": True}
 
 
@@ -522,15 +545,47 @@ def api_job_audio(jid: int, format: str = "webm", request: Request = None):
     return _serve_audio(jid, format, request)
 
 
+def _parse_range(header: str, size: int):
+    """RFC 7233 single-range -> (start, end) vklyuchitel'no, | 'unsatisfiable'
+    (416) | 'invalid' (ignoriuem, otdaem 200) | None (niet diapazona).
+
+    Preduprezhdeniye: `bytes=-500` — ETO POSLEDNIE 500 baytov, a ne 0..500;
+    nechetkiy header ne dolzhen davat' 500; start>=size -> 416."""
+    if not header.startswith("bytes="):
+        return None
+    spec = header[6:]
+    if "," in spec:  # mnogodiapazonnyy zapros — prosto otdaem file celikom
+        return None
+    start_s, _, end_s = spec.partition("-")
+    try:
+        if start_s == "" and end_s == "":
+            return "invalid"
+        if start_s == "":  # suffix: poslednie N baytov
+            suffix = int(end_s)
+            if suffix <= 0 or size == 0:
+                return "unsatisfiable"
+            return max(0, size - suffix), size - 1
+        start = int(start_s)
+        end = int(end_s) if end_s else size - 1
+    except ValueError:
+        return "invalid"
+    if size == 0 or start >= size:
+        return "unsatisfiable"
+    if start > end:
+        return "invalid"
+    return start, min(end, size - 1)
+
+
 def _serve_path(path: Path, mime: str, request: Request | None):
     size = path.stat().st_size
     range_header = request.headers.get("range") if request else None
-    if range_header and range_header.startswith("bytes="):
-        start_s, _, end_s = range_header[6:].partition("-")
-        start = int(start_s) if start_s else 0
-        end = int(end_s) if end_s else size - 1
-        end = min(end, size - 1)
-        length = max(0, end - start + 1)
+    parsed = _parse_range(range_header, size) if range_header else None
+    if parsed == "unsatisfiable":
+        return Response(status_code=416, headers={
+            "Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"})
+    if isinstance(parsed, tuple):
+        start, end = parsed
+        length = end - start + 1
 
         def chunks():
             with open(path, "rb") as f:
@@ -604,7 +659,10 @@ def api_patch_segments(pid: int, body: SegmentPatch):
             raise HTTPException(404)
         updated = 0
         for item in body.segments:
-            seg = s.get(Segment, item.get("id"))
+            sid = item.get("id")
+            if not isinstance(sid, int):
+                continue  # dict/list pk → ArgumentError → 500; prosto propuskaem
+            seg = s.get(Segment, sid)
             if seg is None or seg.job_id != p.job_id:
                 continue
             if "speaker_name" in item and item["speaker_name"]:
@@ -828,7 +886,6 @@ def api_delete_profile(vid: int):
         v = s.get(VoiceProfile, vid)
         if v is None:
             raise HTTPException(404)
-        base = os.environ.get("DATA_DIR", "/data")
         for p in (v.sample_paths or []):
             try:
                 Path(p).unlink(missing_ok=True)
@@ -839,6 +896,28 @@ def api_delete_profile(vid: int):
     return {"ok": True}
 
 
+def _stream_upload_to(file: UploadFile, dest: Path, max_bytes: int) -> int:
+    """Perepisyvaet upload chunkami s potolkom: `write_bytes(await file.read())`
+    derzhal vsey file v RAM (10 GB POST = 10 GB RSS) i puskal quality_gate
+    lish' posle polnoy zapisi."""
+    written = 0
+    with open(dest, "wb") as out:
+        while True:
+            chunk = file.file.read(1024 * 1024)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > max_bytes:
+                out.close()
+                dest.unlink(missing_ok=True)
+                raise HTTPException(413, f"File bolshe {max_bytes // 1024 // 1024} MB")
+            out.write(chunk)
+    return written
+
+
+SAMPLE_MAX_BYTES = int(float(os.environ.get("SAMPLE_MAX_MB", "64") or 64) * 1024 * 1024)
+
+
 @app.post("/api/voice-profiles/{vid}/sample")
 async def api_upload_sample(vid: int, file: UploadFile = File(...)):
     """FT-29a: zapis' s mikrofona (MediaRecorder webm). Embedding schitaet
@@ -847,21 +926,27 @@ async def api_upload_sample(vid: int, file: UploadFile = File(...)):
     etalonam ~0). Esli API sobran s ASR — schitaem inline, inache v ochered'.
 
     Udalennyy rezhim kacheira: kachestvo proveryaetsya zdes' (ffmpeg est'
-    v oboih obraze), embedding — v workere."""
+    v oboih obraze), embedding — v workere. Tyazhyolye shagi (ffprobe v
+    quality_gate, inferens pyannote) ukhodyat v threadpool, chtoby ne veshat'
+    event loop (htmx-optrosy, statusy ot web-bot) na desyatki sekund."""
     with get_session() as s:
         if s.get(VoiceProfile, vid) is None:
             raise HTTPException(404)
     dest_dir = Path(os.environ.get("DATA_DIR", "/data")) / "voice_samples" / str(vid)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / f"sample_{dt.datetime.now(dt.timezone.utc):%Y%m%d_%H%M%S}.webm"
-    dest.write_bytes(await file.read())
+    try:
+        await run_in_threadpool(_stream_upload_to, file, dest, SAMPLE_MAX_BYTES)
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise
     from ..core.speaker import _embedding_backend, compute_embedding_for_file, quality_gate
-    ok, reason = quality_gate(dest)
+    ok, reason = await run_in_threadpool(quality_gate, dest)
     if not ok:
         dest.unlink(missing_ok=True)
         return {"ok": False, "reason": reason}
     if _embedding_backend() == "pyannote":
-        emb = compute_embedding_for_file(dest)
+        emb = await run_in_threadpool(compute_embedding_for_file, dest)
         if not emb:
             return {"ok": False,
                     "reason": "ne udalos' postroit' embedding (srabrable?)"}
@@ -1096,11 +1181,29 @@ def api_upload_offset(uid: int):
     return {"offset": off, "status": status}
 
 
+def _chunk_body_cap() -> int:
+    # odin POST chunka ne dolzhen byt' bolshe shtatnogo chanka s zapasom.
+    # Bez potolka ogromnyy POST = OOM API. (Summyaranyy razmer filya proveryaet
+    # uzhe append_chunk po UPLOAD_MAX_GB — zdes' imenno POTOLK NA ZAPROS.)
+    return (uploads_svc.chunk_mb() * 2 + 8) * 1024 * 1024
+
+
 @app.post("/api/uploads/{uid}/chunk")
 async def api_upload_chunk(uid: int, request: Request, offset: int | None = None):
-    data = await request.body()
+    cap = _chunk_body_cap()
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > cap:
+        raise HTTPException(413, f"Fragmient bolshe {cap // 1024 // 1024} MB")
+    # chitaem s potolkom, chtoby klent s obmanutym/neizvestnym length ne sobral
+    # ves' potok v RAM prezhde chem my ego otvergnem
+    buf = bytearray()
+    async for piece in request.stream():
+        buf += piece
+        if len(buf) > cap:
+            raise HTTPException(413, f"Fragmient bolshe {cap // 1024 // 1024} MB")
+    data = bytes(buf)
     try:
-        up = uploads_svc.append_chunk(uid, data, offset=offset)
+        up = await run_in_threadpool(uploads_svc.append_chunk, uid, data, offset=offset)
     except (OverflowError,) as e:
         raise HTTPException(413, str(e))
     except KeyError:
@@ -1423,8 +1526,13 @@ def web_job_rerun_llm(jid: int):
 
 @app.post("/jobs/import-ics")
 async def web_import_ics(file: UploadFile = File(...)):
-    text = (await file.read()).decode("utf-8", errors="replace")
-    n = import_ics(text)
+    raw = await file.read(64 * 1024 * 1024 + 1)
+    if len(raw) > 64 * 1024 * 1024:
+        raise HTTPException(413, "Слишком большой .ics (макс. 64 МБ)")
+    text = raw.decode("utf-8", errors="replace")
+    # parse + N*(create_job+scheduler add) — tyazhelyy sinkhronnyy kod: vnesh',
+    # chtoby ne blokirovat' event loop na vse htmx-optrosy
+    n = await run_in_threadpool(import_ics, text)
     return {"imported": n}
 
 

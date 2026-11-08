@@ -13,8 +13,11 @@ export function loadConfig() {
     // avoviyod: posle vklyucheniya zapisi zhdyom greyys-min, daleyshiy
     // uroven' zvuka nizhe poroga (dBFS) >= silenceEndTimeoutMin podryad -> Leave
     silenceGraceMin: int(process.env.SILENCE_GRACE_MIN, 30),
-    silenceLevelDb: parseFloat(process.env.SILENCE_LEVEL_DB) <= 0
-      ? parseFloat(process.env.SILENCE_LEVEL_DB) : -50,
+    // porog v dBFS (vsegda otritsatel'nyy). Ranshe `<= 0` propuskalo 0,
+    // a `> 0` v izmeryaemom diapazone byvaet redko (0 dBFS = clip),
+    // SILENCE_LEVEL_DB=0 delayu kazhdiy tik "tishinoy" -> avovyhod v lyuboy
+    // vstreche posle greyysa.
+    silenceLevelDb: silenceDb(process.env.SILENCE_LEVEL_DB, -50),
     maxDurationMin: int(process.env.BOT_MAX_DURATION_MIN, 360),
     pageReloadRetries: int(process.env.PAGE_RELOAD_RETRIES, 2),
     announceEnabled: isAnnounceEnabled(process.env),
@@ -45,6 +48,13 @@ function int(v, d) {
   return Number.isFinite(n) ? n : d;
 }
 
+// dBFS porog: tol'ko otritsatel'nyy v razumnom diapazone; 0/+/NaN -> default.
+function silenceDb(v, d) {
+  const n = parseFloat(v);
+  if (!Number.isFinite(n) || n >= 0 || n < -120) return d;
+  return n;
+}
+
 // Vkl/vykl flag: pustoy/neraspoznnannoe -> default; 0/false/off/no -> vykl.
 export function boolFlag(v, d = true) {
   const s = String(v ?? "").trim().toLowerCase();
@@ -61,7 +71,11 @@ export function isAnnounceEnabled(env = process.env) {
 // Normalizatsiya ssylki-priglasheniya (FT-1).
 export function buildJoinUrl(cfg, meetingId, pwd) {
   let url = cfg.urlTemplate.replace("{meeting_id}", meetingId);
-  if (pwd) url = url.replace("{pwd}", pwd);
-  else url = url.replace("?pwd=", "").replace("&pwd=", "");
+  if (pwd) return url.replace("{pwd}", pwd);
+  // bez parolya: snyat' VSU parametr, a ne znachenie — inache
+  // ".../join?pwd={pwd}" prevrashchaetsya v ".../join{pwd}" (not_started)
+  url = url.replace("{pwd}", "");
+  url = url.replace(/[?&]pwd=(?=&|$)/, "");
+  url = url.replace(/[?&]$/, "");
   return url;
 }

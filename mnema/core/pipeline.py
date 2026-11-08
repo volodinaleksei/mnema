@@ -29,32 +29,55 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
 }
 
 
+class TransitionRace(Exception):
+    """Status izmenilsya paralel'nym pisatelem mezhdu proveryushchim chteniem i
+    kazhom (uslovnyj UPDATE ne zatronul ni odnoy stroke)."""
+
+
 def transition(job_id: int, new_status: str, *, error: str | None = None,
                fail_reason: str | None = None, event: str | None = None,
                notify: bool = True,
                screenshot_path: str | None = None) -> Job:
-    with get_session() as s:
-        job = s.get(Job, job_id)
-        if job is None:
-            raise KeyError(job_id)
-        cur = job.status
-        if new_status not in ALLOWED_TRANSITIONS.get(cur, set()):
-            raise ValueError(f"Недопустимый переход статуса: {cur} -> {new_status}")
-        job.status = new_status
-        if error:
-            job.error = error
-        if fail_reason:
-            job.fail_reason = fail_reason
-        if new_status == "recording" and job.started_ts is None:
-            job.started_ts = dt.datetime.now(dt.timezone.utc)
-        if new_status in ("done", "failed"):
-            job.ended_ts = dt.datetime.now(dt.timezone.utc)
-        if event:
-            s.add(SessionEvent(job_id=job_id, event=event, detail=f"статус: {new_status}"))
-        s.commit()
-        s.refresh(job)
-        snap = dict(id=job.id, topic=job.topic, mid=job.zoom_meeting_id,
-                    attempts=job.join_attempts)
+    from sqlalchemy import update
+    # TOCTOU-gonku (check-then-act v odnoy transaktcii viden snapshot, no
+    # vtoroy kommit pereterayet pervy) zakryvaem uslovnym UPDATE ... WHERE
+    # status = :cur: esli paralel'nyy writer smenil status ranshe nas, rowcount
+    # = 0 i my podnimaem TransitionRace vmesto tishogo perepryedeleniya.
+    for attempt in range(3):
+        with get_session() as s:
+            job = s.get(Job, job_id)
+            if job is None:
+                raise KeyError(job_id)
+            cur = job.status
+            if new_status not in ALLOWED_TRANSITIONS.get(cur, set()):
+                raise ValueError(
+                    f"Недопустимый переход статуса: {cur} -> {new_status}")
+            sets: dict = {"status": new_status}
+            if error:
+                sets["error"] = error
+            if fail_reason:
+                sets["fail_reason"] = fail_reason
+            now = dt.datetime.now(dt.timezone.utc)
+            if new_status == "recording" and job.started_ts is None:
+                sets["started_ts"] = now
+            if new_status in ("done", "failed"):
+                sets["ended_ts"] = now
+            res = s.execute(
+                update(Job).where(Job.id == job_id, Job.status == cur)
+                .values(**sets))
+            if res.rowcount == 0:
+                s.rollback()
+                continue  # paralel'nyy writer vyigral — perychitat' i provit' snova
+            if event:
+                s.add(SessionEvent(job_id=job_id, event=event,
+                                   detail=f"статус: {new_status}"))
+            s.commit()
+            s.refresh(job)
+            snap = dict(id=job.id, topic=job.topic, mid=job.zoom_meeting_id,
+                        attempts=job.join_attempts)
+            break
+    else:
+        raise TransitionRace(f"job {job_id}: status ne dal pereiti v {new_status}")
     if new_status == "failed" and fail_reason and notify:
         NotifyService().enqueue_job_failed(
             job_id=snap["id"], topic=snap["topic"], meeting_id=snap["mid"],

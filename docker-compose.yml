@@ -6,7 +6,9 @@ services:
     command: ["python", "-m", "mnema.api.main"]
     env_file: .env
     environment:
-      - DATABASE_URL=sqlite:////data/db.sqlite
+      # peremennaya iz .env dolzhna peremenyat' put' (pri pereezd na Postgres);
+      # ranshe zhar-kod v `environment:` perebival env_file — silentnaya lovushka
+      - DATABASE_URL=${DATABASE_URL:-sqlite:////data/db.sqlite}
       - ARCHIVE_DIR=/data/archive
       - TZ=Europe/Moscow
       - APP_TZ=Europe/Moscow
@@ -28,7 +30,21 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # /est' health-endpoint: container-start != API-gotov; ran'she deploy
+      # obyhal'sya `sleep 8 + curl` kak vneshtney kostyl'
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging: &default-logging
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     restart: unless-stopped
 
   worker:
@@ -40,7 +56,9 @@ services:
     command: ["python", "-m", "mnema.worker.main"]
     env_file: .env
     environment:
-      - DATABASE_URL=sqlite:////data/db.sqlite
+      # worker: tot zhe put' BDD cherez env (bez zharkoda, pereezd na Postgres
+      # = odna stroka v .env)
+      - DATABASE_URL=${DATABASE_URL:-sqlite:////data/db.sqlite}
       - ARCHIVE_DIR=/data/archive
       - TZ=Europe/Moscow
       - APP_TZ=Europe/Moscow
@@ -65,7 +83,18 @@ services:
       - hf-cache:/root/.cache/huggingface
       - "${EXPORT_HOST_DIR:-/dev/null-export-deactivated}:/export"
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+    # RQ-horse ne imeet HTTP-endpoint. Osnovnoy priznak zhizni — molotok,
+    # kotoryy worker-potok trogaet kazhdy 30 s na obshchem /data
+    # (mnema/worker/main.py): esli glavnyy protsess zyblk — molotok molchit.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; p='/data/worker.heartbeat'; sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p)<90 else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    logging: *default-logging
     restart: unless-stopped
 
   web-bot:
@@ -89,13 +118,31 @@ services:
       # i/ili VNC_PASSWORD dlya samogo VNC-protokola.
       - "${VNC_PUBLISH_BIND:-}8080-8100:6080-6100"
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+    # molotok zhivosti (web-bot/src/index.js startHeartbeatFile) kazhdy 15 s;
+    # esli event loop zyblitsa — molotok molchit (node est' v obraze, python net)
+    healthcheck:
+      test: ["CMD", "node", "-e", "const fs=require('fs');const p=process.env.WEBBOT_HEARTBEAT_FILE||(process.env.DATA_DIR||'/data')+'/web-bot.heartbeat';try{process.exit(Date.now()-fs.statSync(p).mtimeMs<90000?0:1)}catch{process.exit(1)}"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging: *default-logging
     restart: unless-stopped
 
   redis:
+    # teg NE pinim na minor: pereklyuchenie image (redis:7 -> redis:7.4)
+    # pereproizvedyet konteyner i sbrosit ochered' launch/LLM-gate (AGENTS.md).
     image: redis:7
     volumes:
       - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *default-logging
     restart: unless-stopped
 
 volumes:

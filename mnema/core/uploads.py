@@ -6,7 +6,9 @@ zapuskaet shtatnyy konveyer (run_asr_pipeline).
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
+import fcntl
 import os
 import shutil
 import uuid
@@ -17,6 +19,24 @@ from sqlalchemy import select
 from .audio import MEDIA_EXTENSIONS, probe_media
 from .db import get_session
 from .models import Job, SessionEvent, Upload
+
+
+@contextlib.contextmanager
+def _upload_lock(upload_id: int):
+    """Kross-processnaya/interpotocnaya serializaciya dopisivaniya odnogo
+    uploada: dva parallel'nyh POST s odnim offsetom ran'she prohodili provierku
+    `eff != cur` oboe i portili fayl interleavannymi baytami. Derzhim LOCK_EX
+    na sosednem lock-fayl ote chteniya bytes_received do commita."""
+    lock_path = _uploads_dir() / f".up{upload_id}.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def max_upload_bytes() -> int:
@@ -136,7 +156,7 @@ def append_chunk(upload_id: int, data: bytes, offset: int | None = None) -> Uplo
     fayl propuskom ili dublirovaniem baytov."""
     if not data:
         raise ValueError("Пустые данные фрагмента")
-    with get_session() as s:
+    with _upload_lock(upload_id), get_session() as s:
         up = s.get(Upload, upload_id)
         if up is None:
             raise KeyError(upload_id)

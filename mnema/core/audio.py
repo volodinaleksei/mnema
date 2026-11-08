@@ -2,16 +2,53 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import wave
 from pathlib import Path
 
+FFMPEG_TIMEOUT_S = float(os.environ.get("FFMPEG_TIMEOUT_S", "7200"))
 
-def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+def run(cmd: list[str], timeout: float | None = None,
+        **kw) -> subprocess.CompletedProcess:
+    """subprocess.run s zashhitoy ot zavisaniya.
+
+    Bez timeout zavishiy ffmpeg (pobityy konteyner, otval CIFS `/export`) derzhit
+    RQ-horse do 4-ch queue-taymauta, a SIGKILL ot RQ osirablyaet process.
+    start_new_session + uboystvo vershiny gropppy pri taymaute garantiuyet,
+    chto potomkov ne ostayotsya. Vzmesto isklyucheniya - returncode=124,
+    chtoby vse vyzyvayushchie, proveryayushchie returncode, obrabotali eto
+    shtatno."""
+    kw.setdefault("stdin", subprocess.DEVNULL)  # ffmpeg ne dolzhen zhdat stdin
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              start_new_session=True,
+                              timeout=timeout or FFMPEG_TIMEOUT_S, **kw)
+    except subprocess.TimeoutExpired as e:
+        if e.stdout is not None and not isinstance(e.stdout, str):
+            e.stdout = e.stdout.decode(errors="replace")
+        if e.stderr is not None and not isinstance(e.stderr, str):
+            e.stderr = e.stderr.decode(errors="replace")
+        if e.pid:
+            try:
+                os.killpg(os.getpgid(e.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        return subprocess.CompletedProcess(
+            cmd, 124, stdout=e.stdout or "",
+            stderr=(e.stderr or "") + f"\nffmpeg run: timeout {timeout or FFMPEG_TIMEOUT_S}s")
+
+
+def _kill_group(pid: int) -> None:
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def decoded_duration_s(path: Path, timeout: float = 900.0) -> float:
@@ -26,8 +63,12 @@ def decoded_duration_s(path: Path, timeout: float = 900.0) -> float:
             ["ffmpeg", "-nostdin", "-nostats", "-v", "error", "-err_detect",
              "ignore_err", "-progress", "pipe:1", "-i", str(path),
              "-f", "null", "-"],
-            capture_output=True, text=True, timeout=timeout)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+            capture_output=True, text=True, timeout=timeout,
+            start_new_session=True)
+    except subprocess.TimeoutExpired as e:
+        _kill_group(e.pid)
+        return 0.0
+    except FileNotFoundError:
         return 0.0
     import re
     best = 0.0
@@ -96,9 +137,14 @@ def repair_webm(webm: Path) -> bool:
 
 
 def webm_to_wav16k(webm: Path, wav: Path) -> None:
-    """webm (opus 48k) -> PCM WAV 16 kHz 16-bit mono (FT-6)."""
+    """webm (opus 48k) -> PCM WAV 16 kHz 16-bit mono (FT-6).
+
+    `-f wav` yavno: vyzvayushchiye pishut v `.part` dlya atomarnoy zamenny,
+    a ffmpeg vyvodit muxer po rasshireniyu i na `meeting.wav.part` padal by
+    s 'Unable to choose an output format'."""
     r = run(["ffmpeg", "-y", "-err_detect", "ignore_err", "-i", str(webm),
-             "-ar", "16000", "-ac", "1", "-sample_fmt", "s16", str(wav)])
+             "-ar", "16000", "-ac", "1", "-sample_fmt", "s16", "-f", "wav",
+             str(wav)])
     if r.returncode != 0:
         raise RuntimeError(f"ffmpeg webm->wav: {r.stderr[-500:]}")
 
@@ -177,9 +223,13 @@ def probe_media(path: Path) -> dict:
 
 
 def media_to_wav16k(src: Path, wav: Path) -> None:
-    """Pervaya audio-dorozhka iz video/audio -> PCM WAV 16 kHz 16-bit mono."""
+    """Pervaya audio-dorozhka iz video/audio -> PCM WAV 16 kHz 16-bit mono.
+
+    `-f wav` yavno (sm. webm_to_wav16k): zapis' idyot v `.part`, rasshireniye
+    kotorogo ffmpeg ne rasspoznaet kak WAV."""
     r = run(["ffmpeg", "-y", "-i", str(src), "-vn", "-map", "0:a:0",
-             "-ar", "16000", "-ac", "1", "-sample_fmt", "s16", str(wav)])
+             "-ar", "16000", "-ac", "1", "-sample_fmt", "s16", "-f", "wav",
+             str(wav)])
     if r.returncode != 0 or not wav.exists() or wav.stat().st_size <= 44:
         wav.unlink(missing_ok=True)
         raise RuntimeError(f"ffmpeg media->wav: {r.stderr[-500:]}")
@@ -325,14 +375,27 @@ def rms_at(wav: Path, t: float, dur: float = 1.0) -> float:
     return (sum(s * s for s in samples) / n) ** 0.5
 
 
-def decode_pcm16_16k(path: Path) -> bytes | None:
-    """Lyuboy audioformat -> PCM s16le mono 16 kГц baytami (None esli ne chinaetsya)."""
+DECODE_GUARD_S = float(os.environ.get("DECODE_GUARD_S", "3600"))
+
+
+def decode_pcm16_16k(path: Path, max_s: float | None = None) -> bytes | None:
+    """Lyuboy audioformat -> PCM s16le mono 16 kГц baytami (None esli ne chinaetsya).
+
+    max_s — zashhita ot RAM-vzryva: dlinnye faily nesmyeslivayutsya tselikom
+    (po defaultu DECODE_GUARD_S). Vozvraschaetsya tol'ko pervye max_s."""
     if shutil.which("ffmpeg") is None:
         return None
+    limit = DECODE_GUARD_S if max_s is None else max_s
+    args = ["ffmpeg", "-nostdin", "-v", "quiet", "-i", str(path)]
+    if limit:
+        args += ["-t", f"{limit:.3f}"]
+    args += ["-ar", "16000", "-ac", "1", "-f", "s16le", "-"]
     try:
-        r = subprocess.run(["ffmpeg", "-v", "quiet", "-i", str(path),
-                            "-ar", "16000", "-ac", "1", "-f", "s16le", "-"],
-                           capture_output=True)
+        r = subprocess.run(args, capture_output=True, stdin=subprocess.DEVNULL,
+                           start_new_session=True, timeout=FFMPEG_TIMEOUT_S)
+    except subprocess.TimeoutExpired as e:
+        _kill_group(e.pid)
+        return None
     except FileNotFoundError:
         return None
     if r.returncode != 0 or not r.stdout:

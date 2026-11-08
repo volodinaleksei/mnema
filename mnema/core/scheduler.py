@@ -6,6 +6,7 @@ za BOT_PREJOIN_SECONDS do start_at. Bez Zoom API.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import os
 import re
 
@@ -17,6 +18,8 @@ from .db import get_session
 from .models import Job, SessionEvent
 from .notify import NotifyService
 from .zoom_link import extract_meeting_id
+
+log = logging.getLogger("mnema.scheduler")
 
 
 def parse_ics(text: str) -> list[dict]:
@@ -36,6 +39,11 @@ def parse_ics(text: str) -> list[dict]:
         if start is None:
             continue
         start_dt = start.dt
+        # all-day VEVENT: DTSTART/DTEND — datetime.date (ne datetime), net
+        # .tzinfo → AttributeError, ktoryy gulsya vysshe i sobytie tishye
+        # propuskalos'. Traktuem kak polunoch' lokal'nogo vremeni.
+        if not isinstance(start_dt, dt.datetime):
+            start_dt = dt.datetime(start_dt.year, start_dt.month, start_dt.day)
         if start_dt.tzinfo is None:
             from .tz import local_to_utc
             start_dt = local_to_utc(start_dt)
@@ -43,6 +51,8 @@ def parse_ics(text: str) -> list[dict]:
         dur_min = None
         if end is not None:
             end_dt = end.dt
+            if not isinstance(end_dt, dt.datetime):
+                end_dt = dt.datetime(end_dt.year, end_dt.month, end_dt.day)
             if end_dt.tzinfo is None:
                 # floating time (RFC 5545): naivnye DTSTART/DTEND — oboe
                 # lokal'noe vremya; traktovat DTEND kak UTC sdvigalo
@@ -176,6 +186,8 @@ def import_ics(text: str) -> int:
                        duration_max_min=ev["duration_max_min"],
                        created_by="ics")
             count += 1
-        except Exception:  # noqa: BLE001 — propuskaem nekorrektnye sobytiya
+        except Exception as e:  # noqa: BLE001 — propuskaem nekorrektnye sobytiya
+            log.warning("ics: propushcheno sobytie %r (%s): %s",
+                        ev.get("topic"), ev.get("uid"), e)
             continue
     return count

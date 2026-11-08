@@ -5,10 +5,40 @@ vydumyvat' imena i fakty; LLM_MODEL_ALLOWLIST — gejt modeley.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
+import logging
 import os
+import time
 
 import httpx
+
+log = logging.getLogger("mnema.llm")
+
+# Global'nyy byudzhet vremenidlya vsey zadachi LLM: retri + ozhidanie zamka +
+# kazhdoe okno map-reduce. Bez nego job mozhet sidet' v ocheredi godya svershe
+# RQ default_timeout (4 ch) i byt' SIGKILL'ded poseredine obrabotki.
+_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "llm_deadline", default=None)
+
+
+def _budget_exceeded() -> bool:
+    d = _deadline.get()
+    return d is not None and time.monotonic() >= d
+
+
+@contextlib.contextmanager
+def llm_budget(seconds: float):
+    """Byudzhet na vse LLM-zaprosy vnutri bloka (sek). Vlozhennye bloki berut
+    bolshiy (samyy ranliy) dyaadlayn — vtoroy ne prodlevayet total'noe ozhidanie."""
+    prev = _deadline.get()
+    new = prev if prev is not None else time.monotonic() + max(1.0, seconds)
+    _deadline.set(new)
+    try:
+        yield
+    finally:
+        _deadline.set(prev)
 
 SYSTEM_PROMPT = (
     "Ty formatshto protokola delovoy vstrechi. Vozvrashi ISTORIMO validny JSON "
@@ -71,6 +101,11 @@ class LLMError(Exception):
     pass
 
 
+class LLMGateWaitError(LLMError):
+    """Ozhidanie ocheredi k LLM ischerpao LLM_LOCK_WAIT_TIMEOUT_S. Nerepetitno:
+    vtoraya popytka zanjala by ochered' snova, umnozhaya ozhidanie."""
+
+
 _THINK_REJECTED = False  # server ne znaet parametr think — bolshe ne peredavat'
 
 
@@ -93,6 +128,15 @@ def _request_timeout_s() -> float:
         return max(30.0, float(os.environ.get("LLM_REQUEST_TIMEOUT_S", "900") or 900))
     except ValueError:
         return 900.0
+
+
+def _job_budget_s() -> float:
+    """Total'nyy byudzhet odnogo protokola (map-reduce okna + reduce + retri).
+    Derzhim nizhe RQ default_timeout (4 ch), chtoby job ne ubivalis' poseredine."""
+    try:
+        return max(120.0, float(os.environ.get("LLM_JOB_BUDGET_S", "10800") or 10800))
+    except ValueError:
+        return 10800.0
 
 
 def _max_tokens() -> int:
@@ -166,9 +210,9 @@ def _post_chat(payload: dict):
             return httpx.post(f"{base}/chat/completions", headers=headers,
                               json=payload, timeout=_request_timeout_s())
     except LLMGateTimeout as e:
-        # zhdali ocheredi slishkom dolgo: eto oshibka LLM, a ne konveyera
-        # (awaiting_llm / split_skipped, mozhno rerunut')
-        raise LLMError(str(e)) from e
+        # zhdali ocheredi slishkom dolgo: nerepetitno (LLMGateWaitError),
+        # chtoby retries ne umnozhali chasovoe ozhidanie na kazhday popytke
+        raise LLMGateWaitError(str(e)) from e
 
 
 class _NativeResp:
@@ -191,7 +235,6 @@ def _native_to_openai(r: httpx.Response) -> _NativeResp:
 
 def _chat(messages: list[dict], retries: int = 2) -> str:
     global _THINK_REJECTED
-    import time
     thinking_on = _thinking_enabled()
     payload: dict = {"model": llm_model(), "messages": messages,
                      "temperature": 0.1}
@@ -207,6 +250,8 @@ def _chat(messages: list[dict], retries: int = 2) -> str:
         payload["thinking"] = {"type": "enabled" if thinking_on else "disabled"}
     last_err = None
     for attempt in range(retries + 1):
+        if _budget_exceeded():
+            raise LLMError(f"byudzhet LLM ischerpan (job deadline)")
         try:
             r = _post_chat(payload)
             if r.status_code >= 400:
@@ -221,9 +266,12 @@ def _chat(messages: list[dict], retries: int = 2) -> str:
                     continue
                 raise LLMError(f"LLM HTTP {r.status_code}: {r.text[:200]}")
             return r.json()["choices"][0]["message"]["content"]
+        except LLMGateWaitError:
+            raise  # ozhidanie zamka — ne retribaem (umnozhayet chasovoe ozhidanie)
         except (LLMError, httpx.HTTPError) as e:
             last_err = e
-            time.sleep(min(2 ** attempt, 8))
+            if attempt < retries:  # ne spyat' posle posledney popytki
+                time.sleep(min(2 ** attempt, 8))
     raise LLMError(str(last_err))
 
 
@@ -281,6 +329,13 @@ def structure_transcript(transcript: str, topic: str = "", roster: str = "",
     (ot noy LLM ischislyayet otnositel'nyye sroki porucheniy). prev_digest —
     kratkoe soderzhanie protokola predydushchey vstrechi (dlya bloka changes)."""
     roster = (roster or "").strip()
+    with llm_budget(_job_budget_s()):
+        return _structure_transcript_inner(transcript, topic, roster, meeting_date,
+                                           prev_digest)
+
+
+def _structure_transcript_inner(transcript, topic, roster, meeting_date,
+                                prev_digest) -> dict:
     date_block = _meeting_date_block(meeting_date)
     max_chars = int(os.environ.get("LLM_WINDOW_CHARS", "24000"))
     if len(transcript) <= max_chars:
@@ -300,6 +355,27 @@ def structure_transcript(transcript: str, topic: str = "", roster: str = "",
                        prev_digest)
 
 
+def _bounded_json(data: dict, max_chars: int) -> str:
+    """JSON ne dolszhen uryvats' poseredine elementa: syroy `[:max_chars]`
+    rezh' item i LLM poluchal polomanny vkhod. Udalyaem tseliye elementy
+    samykh dlinykh spiskov, poka serializaciya ne uleditsya."""
+    s = json.dumps(data, ensure_ascii=False)
+    if len(s) <= max_chars:
+        return s
+    import copy
+    data = copy.deepcopy(data)
+    droppable = sorted(("topic_summaries", "action_items", "agenda",
+                        "decisions", "open_questions"),
+                       key=lambda k: -len(data.get(k) or []))
+    for key in droppable:
+        items = data.get(key) or []
+        while items and len(json.dumps(data, ensure_ascii=False)) > max_chars:
+            items.pop()
+        if len(json.dumps(data, ensure_ascii=False)) <= max_chars:
+            return json.dumps(data, ensure_ascii=False)
+    return json.dumps(data, ensure_ascii=False)  # minimal'nyy — ostal'noye ne rezhem
+
+
 def _map_reduce(transcript: str, topic: str, max_chars: int, roster: str = "",
                 meeting_date: str = "", prev_digest: str = "") -> dict:
     date_block = _meeting_date_block(meeting_date)
@@ -312,7 +388,11 @@ def _map_reduce(transcript: str, topic: str, max_chars: int, roster: str = "",
         windows.append(transcript[i:i + max_chars])
         i += step
     partials: list[dict] = []
+    failed_windows: list[int] = []  # M2: tiho propushchennoe okno = teryannaya chast' protokola
     for idx, w in enumerate(windows):
+        if _budget_exceeded():
+            failed_windows.extend(range(idx, len(windows)))
+            break
         user = (f"{date_block}OKNO {idx + 1} iz {len(windows)}. Vytashi iz eta fragmanta "
                 f"po skHEME (chastichno): podrobnye svodki po temam (topic_summaries, "
                 f"se so vsemi tsiframi i markeramy), resheniya, zadachi, otkrytye voprosy, "
@@ -321,7 +401,10 @@ def _map_reduce(transcript: str, topic: str, max_chars: int, roster: str = "",
             reply = _chat([{"role": "system", "content": SYSTEM_PROMPT},
                            {"role": "user", "content": user}])
             partials.append(validate_protocol(_extract_json(reply)))
+        except LLMGateWaitError:
+            raise  # zamyok: ne tonkaya oshibka okna, a sistemnaya — podnyimaem
         except LLMError:
+            failed_windows.append(idx)
             continue
     if not partials:
         raise LLMError("map-reduce: ni odno okno nie dalo valid JSON")
@@ -345,7 +428,11 @@ def _map_reduce(transcript: str, topic: str, max_chars: int, roster: str = "",
                 merged["attendees"].append(a)
         for ai in p.get("action_items") or []:
             merged["action_items"].append(ai)
-    reduce_input = json.dumps(merged, ensure_ascii=False)[:max_chars]
+    reduce_input = _bounded_json(merged, max_chars)
+    if failed_windows:
+        log.warning("map-reduce: %d/%d okon davali oshibku (soderzhanie vyshlo "
+                    "iza protokola): %s", len(failed_windows), len(windows),
+                    failed_windows[:20])
     reply = _chat([
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": (date_block

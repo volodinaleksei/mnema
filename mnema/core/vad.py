@@ -5,12 +5,23 @@ korotkie (<0.5 s) otbrossyvayutsya; dlina cel 3-15 s (razrez po maksimumu).
 """
 from __future__ import annotations
 
+import logging
 import os
+import time
 import wave
 from pathlib import Path
 
+log = logging.getLogger("mnema.vad")
+
 TARGET_MAX_S = 15.0
 MIN_SPEECH_S = 0.5
+
+
+def _retry_sec() -> float:
+    try:
+        return max(0.0, float(os.environ.get("VAD_RETRY_SEC", "600")))
+    except ValueError:
+        return 600.0
 
 
 def segment_speech(wav: Path) -> list[dict]:
@@ -21,25 +32,34 @@ def segment_speech(wav: Path) -> list[dict]:
     if backend is not None and wav.exists():
         try:
             return _silero_segments(backend, wav)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001 — energy-fallback, no s logom
+            log.warning("silero VAD failed (%s) — energy fallback", e)
     return _energy_segments(wav)
 
 
 _silero = None
+_silero_failed_ts = 0.0
 
 
 def _get_silero():
-    global _silero
-    if _silero is not None:
+    """Silero-model': None yesli niedostupna; povtor popytki cherez
+    VAD_RETRY_SEC (prezhniy vechnyy `= False` keshiral slabost'/diskovyy
+    glitk navsegda i vse posledyushchie job tratili kachestvennyy VAD)."""
+    global _silero, _silero_failed_ts
+    if _silero:
         return _silero
+    if _silero is False and time.monotonic() - _silero_failed_ts < _retry_sec():
+        return None
     try:
         import torch  # noqa: F401
         from silero_vad import load_silero_vad
         _silero = load_silero_vad()
         return _silero
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        log.warning("silero VAD unavailable (%s); retry in %ds",
+                    e, int(_retry_sec()))
         _silero = False
+        _silero_failed_ts = time.monotonic()
         return None
 
 
@@ -63,23 +83,27 @@ def _energy_segments(wav: Path) -> list[dict]:
         with wave.open(str(wav), "rb") as w:
             sr = w.getframerate()
             n = w.getnframes()
-            raw = w.readframes(n)
     except Exception:  # noqa: BLE001
         return []
     struct_mod = __import__("struct")
     frame = max(1, int(sr * 0.03))
-    energies = []
-    total = len(raw) // 2
-    samples_count = total
-    for i in range(0, samples_count, frame):
-        chunk = raw[i * 2:(i + frame) * 2]
-        n = len(chunk) // 2
-        if n == 0:
-            break
-        samples = struct_mod.unpack(f"<{n}h", chunk[: 2 * n])
-        if not samples:
-            break
-        energies.append((sum(s * s for s in samples) / n) ** 0.5)
+    energies: list[float] = []
+    # Po-tokennoe chtenie (ne vsey file v RAM): 3-chasovaya zapis' — ~330 MB
+    # syrykh baytov; pri memory-limit konteynera eto OOM.
+    step_frames = frame * 50
+    with wave.open(str(wav), "rb") as w:
+        for base in range(0, n, step_frames):
+            chunk = w.readframes(min(step_frames, n - base))
+            cnt = len(chunk) // 2
+            for i in range(0, cnt, frame):
+                sub = chunk[i * 2:(i + frame) * 2]
+                m = len(sub) // 2
+                if m == 0:
+                    break
+                samples = struct_mod.unpack(f"<{m}h", sub[: 2 * m])
+                if not samples:
+                    break
+                energies.append((sum(s * s for s in samples) / m) ** 0.5)
     if not energies:
         return []
     hi, lo = energy_thresholds(energies)

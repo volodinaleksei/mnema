@@ -19,6 +19,44 @@ const cfg = loadConfig();
 const recorders = new Map();
 const salvaging = new Set();
 
+// Odin neobrabotanny rejection ubival protsess i vse zhivye zapisi srazu
+// (v sovremennom Node eta fatal'no). Lisheniyu: rech' v zapisi prodolzhaetsya,
+// signaliruem v tsent. uncaughtException — to zhe, no s razresheniem vyjti,
+// esli ih mnogo (sostoyaniye protsessa nepredskazuemo).
+let fatalCount = 0;
+process.on("unhandledRejection", (e) => {
+  log.error("unhandledRejection:", e && e.stack || e);
+});
+process.on("uncaughtException", (e) => {
+  log.error("uncaughtException:", e && e.stack || e);
+  if (++fatalCount >= 5) {
+    log.error("slishkom mnogo fatal'nyh isklyucheniy — vyhod");
+    process.exit(1);
+  }
+});
+
+// Khorosho rasstavit'sya pri `docker stop`: prosim rekordery ostanovitsya,
+// daem finalize ogranichennoe okno (docker grace), inache finalize dozhidaetsya
+// tol'ko watchdogom/salvage posle perepuska.
+let draining = false;
+function installShutdown() {
+  const onSig = async (sig) => {
+    if (draining) return;
+    draining = true;
+    log.info(`${sig}: ostanavlivayu ${recorders.size} zapisey, dayu 25 s na finalize`);
+    for (const [id, h] of recorders) {
+      try { h.requestStop?.("drain"); } catch { /* */ }
+    }
+    const t0 = Date.now();
+    while (recorders.size && Date.now() - t0 < 25000) {
+      await sleep(500);
+    }
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => onSig("SIGTERM"));
+  process.on("SIGINT", () => onSig("SIGINT"));
+}
+
 // Fayl-molotok na obshchem volume /data: watchdog api (maintenance_job)
 // razlichaet «web-botumer» (molotok tikh) ot «web-bot zhiv, no job bez
 // sobytiy» — vtoroy sluchay salvageNie nuzhen, zhivoy protsess sam
@@ -79,17 +117,45 @@ async function startupSalvageScan() {
   }
 }
 
+// Zaroda zadach (parallel'nykh Chromium) — bez nego vsplesk raspisaniya
+// zapuskayet neskol'ko browserov srazu, pamyat' upadaet, i propadayet vse.
+const MAX_CONCURRENT = intCfg(process.env.BOT_MAX_CONCURRENT, 4);
+const inFlight = new Set();
+
+// job_id iz ocheredi ispol'zuyetsya v putyah (rmSync recursive v vnc_manager) —
+// puston' kakaia-bud' stroka = put'-traversal. Startup-skan provit `/^\d+$/`,
+// no puti ocheredi net. Otkazyvaemsia pri pervoy zhe proverka.
+function validJobId(v) {
+  return Number.isInteger(v) && v >= 0 && v < 1e9;
+}
+
+function parseJob(raw, redis, queueLabel) {
+  let obj;
+  try { obj = JSON.parse(raw); } catch {
+    log.error(`nerazboraemyy payload v ${queueLabel} — v DLQ`);
+    redis.lPush("mnema:dlq", JSON.stringify({ q: queueLabel, raw: String(raw).slice(0, 2000), ts: new Date().toISOString() })).catch(() => {});
+    return null;
+  }
+  if (!validJobId(obj.job_id)) {
+    log.error(`otkazan job_id ${JSON.stringify(obj.job_id)} v ${queueLabel} — v DLQ`);
+    redis.lPush("mnema:dlq", JSON.stringify({ q: queueLabel, reason: "bad_job_id", raw: String(raw).slice(0, 2000), ts: new Date().toISOString() })).catch(() => {});
+    return null;
+  }
+  return obj;
+}
+
 async function main() {
   log.info("start, poll", JSON.stringify({
     prejoin: cfg.prejoinSeconds, joinDeadlineMin: cfg.joinDeadlineMin,
     maxDurationMin: cfg.maxDurationMin, announce: cfg.announceWav,
     announceEnabled: cfg.announceEnabled,
-    vncMaxSlots: cfg.vncMaxSlots,
+    vncMaxSlots: cfg.vncMaxSlots, maxConcurrent: MAX_CONCURRENT,
   }));
   const redis = createClient({ url: cfg.redisUrl });
   redis.on("error", (e) => log.error("redis:", e.message));
   await redis.connect();
   setVncDeps(redis, cfg);
+  installShutdown();
   startHeartbeatFile();
   await startupCleanup();
   startupSalvageScan().catch((e) => log.error("salvage scan:", e.message));
@@ -101,46 +167,85 @@ async function main() {
   startHeartbeat();
 
   let processing = new Set();
+  let hcBusy = false;
 
   while (true) {
     try {
       // 1. novye zadachi starta
       const item = await redis.brPop("mnema:launch", 2);
       if (item) {
-        const task = JSON.parse(item.element);
-        if (!processing.has(task.job_id)) {
-          processing.add(task.job_id);
-          runTask(task, redis).finally(() => processing.delete(task.job_id));
+        const task = parseJob(item.element, redis, "mnema:launch");
+        if (task && !processing.has(task.job_id)) {
+          if (inFlight.size >= MAX_CONCURRENT) {
+            // ne teryaem zadau: vozvrat v ochered' (LPUSH = v golovu), otdadim
+            // popozhe kogda osvoboditsya slot; otryv ne budet, no i OOM net
+            await redis.lPush("mnema:launch", item.element);
+            log.warn("zapas zapisey (cap", MAX_CONCURRENT, ") — vozvrat v ochered'");
+            await sleep(3000);
+          } else {
+            processing.add(task.job_id);
+            inFlight.add(task.job_id);
+            runTask(task, redis).finally(() => {
+              processing.delete(task.job_id);
+              inFlight.delete(task.job_id);
+            });
+          }
         }
       }
       const stop = await redis.rPop("mnema:stop");
       if (stop) {
-        const s = JSON.parse(stop);
-        log.info("stop requested for", s.job_id, s.reason || "");
-        recorders.get(s.job_id)?.requestStop(s.reason);
+        const s = parseJob(stop, redis, "mnema:stop");
+        if (s) {
+          log.info("stop requested for", s.job_id, s.reason || "");
+          const h = recorders.get(s.job_id);
+          if (h?.requestStop) h.requestStop(s.reason);
+          else if (h) h.pendingStop = s.reason; // yeto ne gotov (recorder zapuskayetsya)
+        }
       }
       const salv = await redis.rPop("mnema:salvage");
       if (salv) {
-        const s = JSON.parse(salv);
-        log.info("salvage requested for", s.job_id, s.reason || "");
-        handleSalvage(s).catch((e) => log.error("salvage:", e.message));
+        const s = parseJob(salv, redis, "mnema:salvage");
+        if (s) {
+          log.info("salvage requested for", s.job_id, s.reason || "");
+          handleSalvage(s).catch((e) => log.error("salvage:", e.message));
+        }
       }
       const vncCmd = await redis.rPop(VNC_QUEUE);
       if (vncCmd) {
-        handleVncCommand(JSON.parse(vncCmd)).catch((e) =>
-          log.error("vnc command:", e.message));
+        let obj = null;
+        try { obj = JSON.parse(vncCmd); } catch {
+          log.error("vnc command: nerazboraemyy JSON");
+        }
+        if (obj) {
+          // vnc-komandy klyuchayutsya ne tol'ko po job_id (est' setup-komandy)
+          if (obj.job_id !== undefined && obj.job_id !== null && !validJobId(obj.job_id)) {
+            log.error("vnc command: otkazan job_id", obj.job_id);
+          } else {
+            handleVncCommand(obj).catch((e) => log.error("vnc command:", e.message));
+          }
+        }
       }
       const hc = await redis.rPop("mnema:session_healthcheck");
-      if (hc) {
-        const ok = await healthCheckSession(cfg);
-        await redis.lPush("mnema:session_health",
-          JSON.stringify({ ok, ts: new Date().toISOString() }));
+      if (hc && !hcBusy) {
+        // health-check zapuskaet zhivoy Chromium (do ~45 s) — vstrechannyy
+        // zdes' on blokiroval vsyu ochered' (launch/stop stalling). Otdelyaem.
+        hcBusy = true;
+        healthCheckSession(cfg).then(async (ok) => {
+          await redis.lPush("mnema:session_health",
+            JSON.stringify({ ok, ts: new Date().toISOString() }));
+        }).catch((e) => log.error("healthcheck:", e.message))
+          .finally(() => { hcBusy = false; });
       }
     } catch (e) {
       log.error("loop error:", e.message);
       await sleep(3000);
     }
   }
+}
+
+function intCfg(v, d) {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) && n > 0 ? n : d;
 }
 
 async function runTask(task, redis) {

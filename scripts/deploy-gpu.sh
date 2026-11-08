@@ -100,6 +100,10 @@ echo "==> Na serve: fetch bundle + reset --hard + compose up -d --build..."
 ssh "$DEST_SSH" bash -s <<EOF
 set -euo pipefail
 cd "$DEST_DIR"
+# Ubirat' bundle s serve pri LYUBOM ishode, a ne tol'ko pri uspehe: ranshe
+# `rm -f` stoyal v konce i pri padenii build/alembic/guard-otkaze
+# /tmp/mnema-deploy-*.bundle napivalis' na serve (na disk 6 GB/5000 vstrech).
+trap 'rm -f "/tmp/$BUNDLE_NAME"' EXIT
 
 git fetch --quiet "/tmp/$BUNDLE_NAME" "refs/heads/$BRANCH"
 git reset --hard --quiet FETCH_HEAD

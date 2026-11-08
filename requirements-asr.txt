@@ -1,9 +1,10 @@
 # Tyazhelye zavisimosti ASR/diarizacii (worker). Otdel'no ot baza,
 # chtoby api-image ne tashchil PyTorch. USTANAVLIVAETSYA: pip install -r requirements-asr.txt
+# Versii zafiksirovany po progonimomu testam venv (torch/numpy pyannote 3.4).
 torch==2.4.1         # pyannote 3.x несовместим с torchaudio>=2.9 (нет AudioMetaData)
 torchaudio==2.4.1
-silero-vad>=5.1
-pyannote.audio>=3.1,<4  # v4 подтягивает gated speaker-diarization-community-1 (PLDA); TZ: 3.1
-faster-whisper>=1.0
-numpy>=1.26
-huggingface_hub<1.0  # pyannote 3.4 zovet hf_hub_download(use_auth_token=...) — udalen v hub 1.x
+silero-vad==6.2.2
+pyannote.audio==3.4.0  # v4 подтягивает gated speaker-diarization-community-1 (PLDA); TZ: 3.1
+faster-whisper==1.2.1
+numpy==2.5.3
+huggingface_hub==0.36.2  # pyannote 3.4 zovet hf_hub_download(use_auth_token=...) — udalen v hub 1.x

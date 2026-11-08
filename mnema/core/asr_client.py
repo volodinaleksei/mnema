@@ -8,12 +8,15 @@ from __future__ import annotations
 import io
 import logging
 import os
+import time
 import wave
 from pathlib import Path
 
 from .capabilities import capability_status
 
 log = logging.getLogger("mnema.asr")
+
+ASR_CHUNK_RETRIES = int(os.environ.get("ASR_CHUNK_RETRIES", "3") or 3)
 
 
 def engine_name() -> str:
@@ -150,6 +153,35 @@ def _gigastt_post(base: str, headers: dict, model: str, body: bytes) -> dict:
     return r.json()
 
 
+def _gigastt_post_retry(base: str, headers: dict, model: str, body: bytes,
+                        retries: int | None = None) -> dict:
+    """POST chunka s backoff: padenie odnogo chunka ne dolzhno sbrosat' ves'
+    progress — ran'she isklyucheniye na chunke 9/10 vyzyvalo polnyy
+    faster-whisper-progon vsey vstrechi v tom zhe jobe."""
+    n = ASR_CHUNK_RETRIES if retries is None else retries
+    last: Exception | None = None
+    for attempt in range(max(1, n)):
+        try:
+            return _gigastt_post(base, headers, model, body)
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if attempt < n - 1:
+                time.sleep(min(2 ** attempt * 2, 15))
+    raise RuntimeError(f"gigastt chunk failed after {n} attempts: {last}")
+
+
+def _local_chunk_fallback(body: bytes, offset: float, rate: int) -> list[dict] | None:
+    """Rasšifrovat' odin chunk lokâl'no (faster-whisper) — segm s absolyutnym
+    vremem. None esli model' niedostupna (togda podnimem isklyucheniye)."""
+    raw = _whisper_raw_bytes(body)
+    if raw is None:
+        return None
+    for s in raw:
+        s["start"] = s.get("start", 0) + offset
+        s["end"] = s.get("end", 0) + offset
+    return raw
+
+
 def _gigastt_chunks(wav: Path) -> dict:
     """Post WAV chunkami: gigastt otkluchaet bolshie multipart-tela (400).
 
@@ -171,7 +203,7 @@ def _gigastt_chunks(wav: Path) -> dict:
         if chunk_frames >= nframes:
             w.rewind()
             return _retrofit_punctuation(
-                _gigastt_post(base, headers, model, _wav_bytes(w.readframes(nframes), nch, sw, rate)))
+                _gigastt_post_retry(base, headers, model, _wav_bytes(w.readframes(nframes), nch, sw, rate)))
 
         raw: list[dict] = []
         lang = None
@@ -181,15 +213,26 @@ def _gigastt_chunks(wav: Path) -> dict:
             take = min(chunk_frames, nframes - pos)
             w.setpos(pos)
             frames = w.readframes(take)
-            payload = _retrofit_punctuation(
-                _gigastt_post(base, headers, model, _wav_bytes(frames, nch, sw, rate)))
             offset = pos / rate
-            for s in payload.get("segments") or []:
-                s = dict(s)
-                s["start"] = s.get("start", 0) + offset
-                s["end"] = s.get("end", 0) + offset
-                raw.append(s)
-            lang = lang or payload.get("language")
+            body = _wav_bytes(frames, nch, sw, rate)
+            try:
+                payload = _retrofit_punctuation(
+                    _gigastt_post_retry(base, headers, model, body))
+                for s in payload.get("segments") or []:
+                    s = dict(s)
+                    s["start"] = s.get("start", 0) + offset
+                    s["end"] = s.get("end", 0) + offset
+                    raw.append(s)
+                lang = lang or payload.get("language")
+            except Exception as e:  # noqa: BLE001
+                # otkaz etogo chunka — transkirbuem lokâl'no, SOHRANYAYA
+                # sdelannuyu rabotu ostal'nyh chunkov (ne polnyy whisper-progon)
+                local = _local_chunk_fallback(body, offset, rate)
+                if local is None:
+                    raise
+                log.warning("chunk at %.0fs: remote failed (%s); local fallback",
+                            offset, e)
+                raw.extend(local)
             if pos + take >= nframes:
                 break
             pos = min(pos + step_frames, nframes - 1)
@@ -285,6 +328,40 @@ def _conf_from_logprob(v: float) -> float:
 _whisper = None
 
 
+def _whisper_model():
+    """Model' singleton (inache gruzim GGPT na kazhdiy padayushchiy chunk)."""
+    global _whisper
+    if _whisper is not None:
+        return _whisper
+    model_id = os.environ.get("ASR_MODEL", "large-v3")
+    if model_id in ("ml_ctc_large", "ml_ctc"):
+        model_id = os.environ.get("WHISPER_FALLBACK_MODEL", "large-v3")
+    try:
+        from faster_whisper import WhisperModel
+        device = os.environ.get("ASR_DEVICE", "cpu")
+        _whisper = WhisperModel(model_id, device=device,
+                                compute_type=_whisper_compute_type(device))
+    except Exception as e:  # noqa: BLE001
+        log.error("faster-whisper unavailable (%s)", e)
+        _whisper = None
+    return _whisper
+
+
+def _whisper_raw_bytes(wav_bytes: bytes) -> list[dict] | None:
+    """Transkribirovat' WAV-byty lokâl'no v syroy format gigastt; None pri
+    niedostupnosti modeli."""
+    model = _whisper_model()
+    if model is None:
+        return None
+    try:
+        seg_iter, _info = model.transcribe(io.BytesIO(wav_bytes), vad_filter=False)
+        return [{"start": s.start, "end": s.end, "text": s.text,
+                 "avg_logprob": getattr(s, "avg_logprob", None)} for s in seg_iter]
+    except Exception as e:  # noqa: BLE001
+        log.error("faster-whisper chunk transcription failed: %s", e)
+        return None
+
+
 def _whisper_compute_type(device: str) -> str:
     """float16 na GPU, int8 na CPU; OVERRIDE: WHISPER_COMPUTE_TYPE."""
     override = os.environ.get("WHISPER_COMPUTE_TYPE", "").strip()
@@ -294,21 +371,12 @@ def _whisper_compute_type(device: str) -> str:
 
 
 def _faster_whisper_transcribe(wav: Path, vad_segments: list[dict]) -> list[dict]:
-    global _whisper
-    model_id = os.environ.get("ASR_MODEL", "large-v3")
-    if model_id in ("ml_ctc_large", "ml_ctc"):
-        model_id = os.environ.get("WHISPER_FALLBACK_MODEL", "large-v3")
-    if _whisper is None:
-        try:
-            from faster_whisper import WhisperModel
-            device = os.environ.get("ASR_DEVICE", "cpu")
-            _whisper = WhisperModel(model_id, device=device,
-                                    compute_type=_whisper_compute_type(device))
-        except Exception as e:  # noqa: BLE001
-            log.error("faster-whisper unavailable (%s) — empty transcript", e)
-            return [{"text": "", "lang": None, "confidence": None} for _ in vad_segments]
+    model = _whisper_model()
+    if model is None:
+        log.error("faster-whisper unavailable — empty transcript")
+        return [{"text": "", "lang": None, "confidence": None} for _ in vad_segments]
     try:
-        seg_iter, _info = _whisper.transcribe(str(wav), vad_filter=False)
+        seg_iter, _info = model.transcribe(str(wav), vad_filter=False)
         raw = [{"start": s.start, "end": s.end, "text": s.text,
                 "avg_logprob": getattr(s, "avg_logprob", None)} for s in seg_iter]
     except Exception as e:  # noqa: BLE001

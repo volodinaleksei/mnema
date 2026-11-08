@@ -98,9 +98,12 @@ def rename_job(job_id: int, topic: str) -> Job | None:
         return job
 
 
+_KEEP = object()  # marker: pole ne prisylalos' — ne trogat' (v otlicie ot None = ochistit')
+
+
 def update_job(job_id: int, *, meeting_link: str = "", pwd: str = "",
                topic: str = "", start_at: dt.datetime | None = None,
-               end_at: dt.datetime | None = None) -> Job:
+               end_at: dt.datetime | None | object = _KEEP) -> Job:
     """Parametry ESHCHYO NE NACHATOY vstrechi (status scheduled).
 
     KeyError esli vstrechi net; ValueError pri validacii ili popytke
@@ -116,10 +119,11 @@ def update_job(job_id: int, *, meeting_link: str = "", pwd: str = "",
     if start_at is not None and start_at.tzinfo is None:
         from .tz import local_to_utc
         start_at = local_to_utc(start_at)
-    if end_at is not None and end_at.tzinfo is None:
+    if end_at is not _KEEP and isinstance(end_at, dt.datetime) \
+            and end_at.tzinfo is None:
         from .tz import local_to_utc
         end_at = local_to_utc(end_at)
-    if end_at is not None and start_at is not None and end_at <= start_at:
+    if isinstance(end_at, dt.datetime) and start_at is not None and end_at <= start_at:
         raise ValueError("Время окончания должно быть позже начала")
     with get_session() as s:
         job = s.get(Job, job_id)
@@ -142,7 +146,8 @@ def update_job(job_id: int, *, meeting_link: str = "", pwd: str = "",
                                     new_pwd)
         if start_at is not None:
             job.start_at = start_at
-        job.end_at = end_at
+        if end_at is not _KEEP:
+            job.end_at = end_at  # None = ocharovano formy, _KEEP = ne prisylalos'
         s.add(SessionEvent(job_id=job_id, event="updated",
                            detail="параметры встречи изменены"))
         s.commit()

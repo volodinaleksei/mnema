@@ -1,4 +1,10 @@
 // Debug2: payti put' vhoda i vyvesti sostoyanie posle kazhdogo shaga.
+//
+// VIMAHNIE: eto odnorazovyy otладochnik NE iz khodovogo koda (nikto ego ne
+// importiruet). Zapusk protiw zhivogo /data/zoom-profile, kotoryy derzhit
+// setup-brauzer, sdul SingletonLock i mozhet izportit' profil' (poterya
+// Zoom-logina). Pered zapuskom ostanovite setup-brauzer/web-bot, ukazhite
+// ZOOM_PROFILE_DIR v otdel'nuyu kopiyu, i NE dayte emu boevoy profil'.
 import { chromium } from "playwright";
 
 const url = process.argv[2];

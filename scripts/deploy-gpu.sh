@@ -100,6 +100,11 @@ echo "==> Na serve: fetch bundle + reset --hard + compose up -d --build..."
 ssh "$DEST_SSH" bash -s <<EOF
 set -euo pipefail
 cd "$DEST_DIR"
+# peredat' DEST_DIR v udalennuyu obolochku: osnovnye stroki heredoc rozvernuly
+# local'no, no \`check-active-jobs\` v guard-ripoverke ssylaetsya na \$DEST_DIR
+# PRI VYPOLNENII na serve — bez eto privyazki tam vkluchen set -u i
+# 'unbound variable' laet SRV_RC, a guard blokuyut deploy po lozhnoy treloge.
+DEST_DIR="$DEST_DIR"
 # Ubirat' bundle s serve pri LYUBOM ishode, a ne tol'ko pri uspehe: ranshe
 # `rm -f` stoyal v konce i pri padenii build/alembic/guard-otkaze
 # /tmp/mnema-deploy-*.bundle napivalis' na serve (na disk 6 GB/5000 vstrech).

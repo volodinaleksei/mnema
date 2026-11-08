@@ -165,7 +165,10 @@ if guard_should_stop "\$SRV_RC" "${FORCE_DEPLOY:-0}"; then
     exit 1
 fi
 
-\$COMPOSE up -d --force-recreate api worker web-bot
+\$COMPOSE up -d --force-recreate --no-deps api worker web-bot
+# ^ --no-deps obyazatel'no: bez nego `up` peresozdayet IZMENYONNYE zavisimosti
+# (napr. dobavlenie healthcheck'a k redis peresozdalo by redis i sbrosilo
+# ochered'), kogda my prosim obnovit' tol'ko api/worker/web-bot.
 
 echo "    proverka zapuska:"
 \$COMPOSE ps --format "{{.Name}} {{.Status}}"

@@ -11,7 +11,11 @@ REST API сервиса `api` (FastAPI). Реализация: `mnema/api/main.p
 Общие соглашения:
 - Все JSON-эндпоинты — префикс `/api`.
 - Даты в JSON — ISO 8601 (UTC); в WEB-формах `datetime-local` интерпретируется как локальное время оператора (МСК) и конвертируется в UTC.
-- Раздача файлов (аудио/видео/образцы) поддерживает HTTP `Range` (206 Partial Content).
+- Раздача файлов (аудио/видео/образцы) поддерживает HTTP `Range` (206 Partial
+  Content) по RFC 7233: одиночный диапазон, суффиксный `bytes=-N` (последние
+  N байт); unsatisfiable диапазон (`start >= size`) → `416` с
+  `Content-Range: bytes */<size>`; невалидный или мультидиапазонный заголовок
+  игнорируется — файл отдаётся целиком (`200`).
 - Ошибки: `404` — объект не найден, `409` — недопустимое состояние/переход,
   `400`/`422` — некорректные данные, `413` — превышен лимит размера.
 
@@ -133,7 +137,12 @@ job переходит в `awaiting_llm` (этап LLM показывается 
 }
 ```
 
-Переход валидируется по таблице выше; нарушение → `409`.
+Переход валидируется по таблице выше; нарушение → `409`. Идемпотентен по
+статусу: пост уже текущего статуса (retry web-bot после сетевого таймаута)
+возвращает `{"ok": true, "status": "...", "already": true}` без перехода.
+Гонка параллельного писателя (status изменился между проверкой и коммитом —
+условный `UPDATE ... WHERE status = :cur`) → `409`, тихого перезаписывания
+нет.
 Ответ: `{"ok": true, "status": "..."}`
 
 ### `POST /api/jobs/{jid}/finished`
@@ -154,6 +163,8 @@ job переходит в `awaiting_llm` (этап LLM показывается 
 ставит в очередь ASR-оркестрацию. Идемпотентен: повторный пост (retry по сети,
 salvage ubitogo web-bot) не даёт 409 — файлы перезаписываются по метаданным,
 ответ `{"ok": true, "already": true}` без повторного transition/enqueue.
+Параллельная смена статуса другим писателем (cancel/retry) тоже не даёт 500 —
+`transition` бросает `TransitionRace` и ответ тот же `already: true`.
 Из статуса `failed` (salvage упавшей задачи — данные на диске) возвращает
 задачу в `processing` с событием `recording_recovered`.
 Ответ: `{"ok": true}`
@@ -253,7 +264,8 @@ FT-32: ручное исправление имён говорящих в сег
 Тело: `{"segments": [{"id": <segment_id>, "speaker_name": "Иванов И. И."}, ...]}`
 
 Для каждого сегмента (проверяется принадлежность job'у протокола, чужие id
-молча пропускаются) проставляется `speaker_name`, `speaker_source=voiceprint`,
+и нецелочисленные `id` (dict/list вместо числа) молча пропускаются)
+проставляется `speaker_name`, `speaker_source=voiceprint`,
 снимается `needs_review`. Если изменён хотя бы один сегмент — опубликованный
 протокол освежается (`refresh_protocol`), чтобы имена в md/docx совпадали.
 
@@ -339,7 +351,8 @@ maintenance по истечении `REVIEW_TIMEOUT_HOURS`; `mixed` — все �
 Пометить фрагмент «Микс голосов»: два человека перебивают друг друга, и
 распознать их по отдельности нельзя (фрагменты длиннее ~5 с с наложением
 диаризация помечает как `multi_voice`). Фрагмент перестаёт уточняться как
-отдельный голос (`speaker_source=voice_mix`, `needs_review` снят), в
+отдельный голос (`speaker_source=voice_mix`, `needs_review` снят, hint-имя
+`speaker_name` очищается — под одним именем нельзя подписывать двух людей), в
 эмбеддинги кластера и в имена не попадает, но остаётся в стенограмме,
 протоколе и входе LLM с пометкой «Два голоса в фрагменте». Если в кластере
 не осталось фрагментов, ждущих решения, — review закрывается
@@ -386,7 +399,9 @@ maintenance по истечении `REVIEW_TIMEOUT_HOURS`; `mixed` — все �
 ### `POST /api/voice-profiles/{vid}/sample`
 
 Загрузка эталонной записи (multipart/form-data, поле `file`, webm с микрофона).
-Проходит quality gate (ffmpeg);embedding считает worker (pyannote/GPU).
+Проходит quality gate (ffmpeg); embedding считает worker (pyannote/GPU).
+Файл принимается потоково с лимитом `SAMPLE_MAX_MB` (по умолчанию 64 МБ) —
+превышение → `413`, временный файл удаляется.
 
 Ответ (inline, если API собран с ASR): `{"ok": true}`
 Ответ (удалённый режим): `{"ok": true, "pending_embedding": true, "worker_queued": bool}`
@@ -446,7 +461,11 @@ maintenance по истечении `REVIEW_TIMEOUT_HOURS`; `mixed` — все �
 
 Чанк файлом в raw body (`Content-Type: application/octet-stream`),
 `offset` — опциональный query. Ответ: `{"offset", "status"}`.
-Несовпадение offset → `409`; превышение лимита → `413`.
+Несовпадение offset → `409`; превышение лимита → `413`. На один запрос
+действует отдельный потолок (≈ 2 × штатный чанк + 8 МБ): `Content-Length`
+больше него или фактически прочитанные байты сверх него → `413` без
+буферизации всего тела в RAM. Параллельные POST одного upload'а
+сериализуются (flock) — interleav байт при гонке двух писателей исключён.
 
 ### `POST /api/uploads/{uid}/finalize`
 
@@ -514,12 +533,12 @@ maintenance по истечении `REVIEW_TIMEOUT_HOURS`; `mixed` — все �
 | `POST /jobs/create` | Форма создания встречи (preset_id / meeting_link / pwd / topic / start_at / end_at / start_now); ошибки — redirect `?error=link|date|preset|end_before_start` |
 | `POST /jobs/{jid}/cancel` | Отмена встречи |
 | `POST /jobs/{jid}/rename` | Переименовать (поле `topic`) |
-| `POST /jobs/{jid}/update` | Редактирование параметров ещё не начатой встречи |
+| `POST /jobs/{jid}/update` | Редактирование ещё не начатой встречи (`meeting_link`/`pwd`/`topic`/`start_at`/`end_at`); пустой `end_at` в форме — очистить (`update_job` различает `None` = очистить и «не присылалось» = не трогать); `end_at <= start_at` → `422` |
 | `POST /jobs/{jid}/delete` | Удаление (для `launching/recording` — `409`) |
 | `POST /jobs/{jid}/leave` | Выход из созвона (как `POST /api/jobs/{jid}/leave`) |
 | `POST /jobs/{jid}/vnc` | Экран встречи (как `POST /api/jobs/{jid}/vnc`) |
 | `POST /jobs/{jid}/rerun-llm` | Перезапуск LLM-анализа (только `done`/`awaiting_llm`, иначе `409`); повторный rerun не копит дубликаты в очереди — ждущая попытка переиспользуется |
-| `POST /jobs/import-ics` | Импорт встреч из ICS-файла (multipart `file`) → `{"imported": N}` |
+| `POST /jobs/import-ics` | Импорт встреч из ICS-файла (multipart `file`) → `{"imported": N}`; файл больше 64 МБ → `413` |
 | `GET /jobs/upload` | Страница загрузки архива (`?job_id=`) |
 | `GET /jobs/{jid}` | Карточка встречи (стадии, события, протокол, reviews) |
 | `GET /jobs/{jid}/log` | Лог событий встречи |

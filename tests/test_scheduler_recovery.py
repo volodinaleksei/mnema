@@ -148,6 +148,21 @@ def test_schedule_job_for_future_respects_prejoin(db, monkeypatch):
     assert delta < 1  # naivnyy datetime iz SQLite = UTC, bez povornogo SDVIGA
 
 
+def test_schedule_job_for_default_prejoin_is_five_minutes(db, monkeypatch):
+    """Bez BOT_PREJOIN_SECONDS bot podklyuchaetsya za 300 s do start_at."""
+    from mnema.core import scheduler, jobs_launch
+    called: list[tuple[int, dt.datetime]] = []
+    monkeypatch.delenv("BOT_PREJOIN_SECONDS", raising=False)
+    monkeypatch.setattr(jobs_launch, "enqueue_launch",
+                        lambda jid, run_at: called.append((jid, run_at)) or True)
+    expected = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=2)
+    jid = _mk_job("scheduled", _mk_naive_utc(expected))
+    scheduler.schedule_job_for(jid)
+    assert len(called) == 1
+    delta = abs((called[0][1] - (expected - dt.timedelta(seconds=300))).total_seconds())
+    assert delta < 1
+
+
 def test_schedule_job_for_naive_utc_not_shifted_by_app_tz(db, monkeypatch):
     """Regressiya vstrechi 56: 14:00 MSK -> run_at 13:58 UTC, a ne na 3 chasa ranshe."""
     from mnema.core import scheduler, jobs_launch

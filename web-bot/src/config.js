@@ -7,7 +7,7 @@ export function loadConfig() {
     botName: process.env.BOT_NAME || "Mnema",
     urlTemplate: process.env.RECORDER_URL_TEMPLATE ||
       "https://app.zoom.us/wc/{meeting_id}/join?pwd={pwd}",
-    prejoinSeconds: int(process.env.BOT_PREJOIN_SECONDS, 120),
+    prejoinSeconds: int(process.env.BOT_PREJOIN_SECONDS, 300),
     joinDeadlineMin: int(process.env.JOIN_DEADLINE_MIN, 10),
     silenceEndTimeoutMin: int(process.env.SILENCE_END_TIMEOUT_MIN, 5),
     // avoviyod: posle vklyucheniya zapisi zhdyom greyys-min, daleyshiy

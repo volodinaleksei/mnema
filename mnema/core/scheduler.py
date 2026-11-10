@@ -84,7 +84,7 @@ def schedule_job_for(job_id: int) -> None:
     with get_session() as s:
         job = s.get(Job, job_id)
         start_at = job.start_at
-    prejoin = int(os.environ.get("BOT_PREJOIN_SECONDS", "120") or 120)
+    prejoin = int(os.environ.get("BOT_PREJOIN_SECONDS", "300") or 300)
     nowts = dt.datetime.now(dt.timezone.utc)
     if start_at is None:
         run_at = nowts

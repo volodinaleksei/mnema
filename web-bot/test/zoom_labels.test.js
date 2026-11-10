@@ -126,6 +126,48 @@ test("verdict: bez endedDialog poryadok ne menyaetsya", () => {
   assert.equal(verdictFromSignals({ ...base, leaveBtn: true, ended: false }), "joined");
 });
 
+// --- dialog "You have been removed" (job 40) ------------------------------------
+import { removedInText, EXIT_DIALOG_SRCS } from "../src/zoom_labels.js";
+
+test("removedInText: angliyskiye varianty udaleniya (job 40)", () => {
+  assert.equal(removedInText("You have been removed"), true);
+  assert.equal(removedInText("You have been removed from this meeting by the host."), true);
+  assert.equal(removedInText("YOU HAVE BEEN  REMOVED"), true);
+});
+
+test("removedInText: russkiye varianty", () => {
+  assert.equal(removedInText("Вас удалили из встречи"), true);
+  assert.equal(removedInText("Вы были удалены"), true);
+});
+
+test("removedInText: ne lozhnyye frazy", () => {
+  assert.equal(removedInText("Remove background noise"), false);
+  assert.equal(removedInText("Participant removed a pin"), false);
+  assert.equal(removedInText(""), false);
+  assert.equal(removedInText(null), false);
+});
+
+test("verdict: removedDialog pobezhdayet leaveBtn (tuslyar eshcho v DOM)", () => {
+  assert.equal(verdictFromSignals({ ...base, removedDialog: true, leaveBtn: true }), "removed");
+  assert.equal(verdictFromSignals({ ...base, removedDialog: true }), "removed");
+});
+
+test("verdict: endedDialog vazhne removedDialog", () => {
+  assert.equal(verdictFromSignals({ ...base, endedDialog: true, removedDialog: true }),
+    "meeting_ended");
+});
+
+test("verdict: bez removedDialog poryadok ne menyaetsya", () => {
+  assert.equal(verdictFromSignals({ ...base, leaveBtn: true }), "joined");
+});
+
+test("EXIT_DIALOG_SRCS: knopka Exit v dialoge udaleniya", () => {
+  const re = (s) => new RegExp(s, "i");
+  assert.ok(EXIT_DIALOG_SRCS.some((s) => re(s).test("Exit")));
+  assert.ok(EXIT_DIALOG_SRCS.some((s) => re(s).test("Выйти")));
+  assert.ok(!EXIT_DIALOG_SRCS.some((s) => re(s).test("Exit fullscreen")));
+});
+
 test("dom-selektory ne pustyye i bez probelov v selectorah", () => {
   assert.ok(JOINED_DOM_SEL.includes("#leave_button"));
   assert.ok(JOINED_DOM_SEL.includes('[data-tid="leave_button"]'));

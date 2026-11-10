@@ -120,6 +120,22 @@ export function meetingEndedInText(text) {
   return re(ENDED_MEETING_SRC).test(String(text || ""));
 }
 
+// --- vynesenie uchastnika hostom (job 40) --------------------------------------
+// Modal' "You have been removed / You have been removed from this meeting by
+// the host." s knopkoy Exit. Tuslyar s Leave pri etom ostayetsya v DOM, a
+// ENDED_MEETING_SRC frazu "removed" ne lovit — bez otdel'nogo signala bot
+// zhivet do tajmera tishiny (job 40: ~8.5 min posle udaleniya).
+export const REMOVED_SRC =
+  "you have\\s+been\\s+removed|removed\\s+from\\s+this\\s+meeting" +
+  "|вас\\s+удалили|вы\\s+были\\s+удалены";
+
+export function removedInText(text) {
+  return re(REMOVED_SRC).test(String(text || ""));
+}
+
+// Knopka v dialoge udaleniya.
+export const EXIT_DIALOG_SRCS = ["^exit$", "^выйти$", "^выход$"];
+
 // Chisty verdict po agregirovannym po signalam (dlya testov).
 // Poryadok vazhen (vstrecha 45/46): structural'nyy priznak zala (leaveBtn)
 // idu PIERED bot_wall — na zhivoy zapisi tekst vstroeannyh freymov (team-chat,
@@ -131,6 +147,7 @@ export function meetingEndedInText(text) {
 export function verdictFromSignals(s) {
   if (s.signRequired) return "login_required";
   if (s.endedDialog) return "meeting_ended";
+  if (s.removedDialog) return "removed";
   if (s.leaveBtn) return "joined";
   if (s.botWall && !s.captcha) return "bot_wall";
   if (s.ended) return "meeting_ended";

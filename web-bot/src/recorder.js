@@ -13,10 +13,10 @@ import { segKey, MIN_SEGMENT_BYTES } from "./seg_key.js";
 import { finalize } from "./salvage.js";
 import { chunkWritePlan } from "./record_guard.js";
 import {
-  END_CONTROL_SRC, LEAVE_SRCS, LEAVE_DIALOG_SRCS,
+  END_CONTROL_SRC, LEAVE_SRCS, LEAVE_DIALOG_SRCS, EXIT_DIALOG_SRCS,
   MIC_CANDIDATE_SRC, MIC_MUTED_SRC, MIC_ACTIVE_SRC, MIC_MUTED_ICON_SRC,
   JOINED_DOM_SEL, NO_AUDIO_SEL, IN_MEETING_SRC, verdictFromSignals,
-  ENDED_MEETING_SRC,
+  ENDED_MEETING_SRC, REMOVED_SRC,
 } from "./zoom_labels.js";
 import { freshProfileCopy, profilesRoot, publicVncPort } from "./vnc_manager.js";
 
@@ -599,10 +599,12 @@ export async function classifyPage(page) {
     info = {};
     const frames = page.frames();
     for (const fr of frames) {
-      const loc = await fr.evaluate(({ endRe, micJoinSel, joinedSel, noAudioSel, inMeetRe, endedRe }) => {
+      const loc = await fr.evaluate(({ endRe, micJoinSel, joinedSel, noAudioSel, inMeetRe, endedRe, removedRe }) => {
         const txt = document.body ? (document.body.textContent || "") : "";
         const has = (s) => txt.toLowerCase().includes(s.toLowerCase());
         const endReObj = new RegExp(endedRe, "i");
+        const removedReObj = new RegExp(removedRe, "i");
+        const dlgSel = ".cbk_dialog, [role=dialog], [role=alertdialog], .modal, [class*='cbk_modal'], [id*='removed']";
         // textContent (nie innerText): u skrytogo tuslyara innerText = ""
         const labelOf = (el) => (
           el.getAttribute("aria-label") || el.getAttribute("title")
@@ -634,6 +636,14 @@ export async function classifyPage(page) {
               const t = (el.textContent || "").toLowerCase();
               return t.length <= 400 && endReObj.test(t);
             }),
+          // Modal "You have been removed ... by the host" (job 40): tuslyar
+          // s Leave ostayetsya v DOM, ENDED_MEETING_SRC frazu ne lovit —
+          // otdel'nyy signal, tak zhe ogranichennyy korotkimi uzlami-dialogami.
+          removedDialog: [...document.querySelectorAll(dlgSel)]
+            .some((el) => {
+              const t = (el.textContent || "").toLowerCase();
+              return t.length <= 400 && removedReObj.test(t);
+            }),
           captcha: /recaptcha/i.test(document.location.href)
                    || document.querySelector("iframe[src*='recaptcha'], .grecaptcha-badge") !== null
                    || has("protected by recaptcha"),
@@ -641,7 +651,7 @@ export async function classifyPage(page) {
       }, {
         endRe: END_CONTROL_SRC, micJoinSel: "#join_with_audio_link, #mic-button",
         joinedSel: JOINED_DOM_SEL, noAudioSel: NO_AUDIO_SEL, inMeetRe: IN_MEETING_SRC,
-        endedRe: ENDED_MEETING_SRC,
+        endedRe: ENDED_MEETING_SRC, removedRe: REMOVED_SRC,
       }).catch(() => null);
       if (!loc) continue;
       for (const k of Object.keys(loc)) info[k] = (info[k] || loc[k]);
@@ -652,6 +662,7 @@ export async function classifyPage(page) {
       ended: !!info.ended, leaveBtn: !!info.leaveBtn, captcha: !!info.captcha,
       waitingRoom: !!info.waitingRoom, joinBrowser: !!info.joinBrowser,
       join: !!info.join, micJoin: !!info.micJoin, endedDialog: !!info.endedDialog,
+      removedDialog: !!info.removedDialog,
     });
   } catch (e) {
     return "pending";
@@ -1194,6 +1205,14 @@ async function waitForEnd(page, cfg, state, onEvent) {
     if (v === "meeting_ended") {
       onEvent(EVENT.ENDED, "страница: встреча завершена");
       return { reason: "meeting_ended" };
+    }
+    if (v === "removed") {
+      // host udalil bota iz sozwona (job 40): zapis' s etoy sekundy pusta —
+      // ne zhidem tajmera tishiny, vyhodim srazu i sohranyaem sobrannoye.
+      // V dialoge yest' knopka Exit — zakryvaem ee, chtoby osvobodit' slot.
+      onEvent(EVENT.ENDED, "ведущий удалил бота из встречи — завершение записи");
+      await dispatchClickByLabel(page, EXIT_DIALOG_SRCS, 12, 5000).catch(() => false);
+      return { reason: "removed_by_host" };
     }
     if (v === "pending") {
       // stranitsa mogla upasť: proverka zhivee li recorder

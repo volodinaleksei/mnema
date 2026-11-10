@@ -5,13 +5,13 @@
 ## Особенности тестов (pytest)
 
 - Python: использовать venv проекта: `./venv/bin/python -m pytest` (см. правило python_venv.md).
-- **Полный прогон `tests/` медленный — ~11 минут (112 passed, 7 skipped).**
+- **Полный прогон `tests/` медленный — ~13 минут (606 passed, 7 skipped).**
   По умолчанию Bash-команды ограничены 120 с, поэтому pytest без явного `timeout`
   будет убит посреди прогона. Всегда передавайте большой `timeout`
   (≥300000 мс) или ограничивайтесь конкретными файлами тестов.
 - Во время разработки гоняйте только затронутые файлы, напр.:
   `timeout 300 ./venv/bin/python -m pytest tests/test_api_integration.py -q`
-  (отдельные файлы быстрые: test_api_integration.py ~5 с).
+   (отдельные файлы быстрые: test_api_integration.py ~35 с).
 - На `tests/` целиком вывод лучше писать в файл:
   `./venv/bin/python -m pytest tests/ -q > /tmp/pytest_out.txt 2>&1; tail -f не нужен — итог в конце файла`.
   Вывод с `| tail` при таймауте теряется полностью.
@@ -26,19 +26,30 @@
 - Переходы статусов в тестах эмулируют web-bot через внутренние
   `POST /api/jobs/{id}/status` (см. `ALLOWED_TRANSITIONS` в `mnema/core/pipeline.py`);
   недопустимый переход → 409, это проверяемое поведение.
-- web-bot (Node.js, `web-bot/`) автотестов не имеет; минимальная проверка —
-  `node --check src/<file>.js` для каждого изменённого файла.
+- web-bot (Node.js, `web-bot/`) — тесты на встроенном раннере: `node --test web-bot/test/`
+  (139 тестов, ~15 с, без npm-зависимостей; fast-check перед коммитом изменений в `web-bot/src/`).
+  Минимальная синтаксическая проверка изменённого файла — `node --check src/<file>.js`.
 
 ## Деплой на GPU-сервер (удалённый ИИ-сервер)
 
 - Сервер: задать в `scripts/deploy-gpu.local.env` (untracked; `DEST_SSH=user@host`,
   `DEST_DIR=...`) или через переменные окружения; в git — только плейсхолдер
   `user@mnema-gpu.internal`. Каталог на сервере: `/data_local/docker/mnema`.
-- Деплой из репо: `./scripts/deploy-gpu.sh` — пуш ветки в origin, на сервере
-  `git fetch origin + git reset --hard origin/<branch>`, затем
+- Деплой из репо: `./scripts/deploy-gpu.sh` — локально создаётся git-bundle текущей
+  ветки, копируется по scp на сервер, там `git fetch <bundle> + git reset --hard FETCH_HEAD`
+  (push в origin не используется, untracked-файлы сервера не затрагиваются), затем
   `docker compose -f docker-compose.yml -f docker-compose.gpu.yml -f docker-compose.override.yml build` +
-  `up -d --force-recreate api worker web-bot` (redis не пересоздавать — сбросит очередь).
+  `run --rm --no-deps api python -m alembic upgrade head` (миграции перед up) +
+  `up -d --force-recreate --no-deps api worker web-bot` (`--no-deps` обязательно —
+  иначе up пересоздаст изменённые зависимости, напр. redis, и сбросит очередь).
   Требует чистое дерево (иначе выходит с ошибкой); коммитить нужно до деплоя.
+  Перед деплоем проверяет активные записи через `GET :8000/api/jobs`
+  (`scripts/check-active-jobs.sh`: launching/recording/uploading → выход с ошибкой,
+  чтобы `--force-recreate web-bot` не убил живой браузер посередине встречи);
+  проверка повторяется на сервере непосредственно перед `force-recreate` (build/alembic
+  длятся минуты — встречa может начаться в этом окне); неизвестное состояние
+  (API недоступен/ответ не разобрался) блокирует так же; политика — `scripts/deploy-guard-lib.sh`
+  (тестируется в tests/test_deploy_active_check.py); обход — `FORCE_DEPLOY=1`.
 - **ВАЖНО: все команды compose на сервере — только с тремя `-f`.** Без
   `docker-compose.gpu.yml` worker поднимется из лёгкого CPU-образа и
   `ASR_DEVICE=cuda:0` потеряется (диаризация/ASR молча пойдут на CPU).

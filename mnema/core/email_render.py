@@ -99,6 +99,7 @@ _JOB_FAILED_HTML = """
 <span style="color:#c0392b;font-weight:bold;">Рекомендуемое действие:</span> {{ action }}
 </div>
 {{ button('Открыть задачу', job_url) }}
+{% if vnc_url %}{{ button('Посмотреть экран совещания (noVNC)', vnc_url, '#c0392b') }}{% endif %}
 {% if screenshot_ok %}
 <div style="margin-top:20px;">
 <div style="color:#8a95a5;font-size:12px;margin-bottom:6px;">Скриншот страницы в момент сбоя:</div>
@@ -117,7 +118,8 @@ meeting_id: {{ meeting_id }}
 Попыток: {{ attempts }}
 Рекомендуемое действие: {{ action }}
 Задача: {{ job_id }}
-Ссылка: {{ job_url }}{% if screenshot_ok %}
+Ссылка: {{ job_url }}{% if vnc_url %}
+Экран совещания (noVNC): {{ vnc_url }}{% endif %}{% if screenshot_ok %}
 Скриншот страницы в момент сбоя — во вложении.{% endif %}
 """
 
@@ -174,6 +176,7 @@ _ALERT_HTML = """
 <p style="margin:0 0 14px;">{{ message | nl2br }}</p>
 {% if rows %}{{ fields(rows) }}{% endif %}
 {{ button('Открыть задачу', job_url) }}
+{{ button('Посмотреть экран совещания (noVNC)', vnc_url, '#c0392b') }}
 {% endcall %}
 """
 
@@ -294,6 +297,7 @@ def render_email(n) -> tuple[str, str, str]:
                 action=action_ru(code),
                 job_id=data.get("job_id", ""),
                 job_url=data.get("job_url") or "",
+                vnc_url=data.get("vnc_url") or "",
                 screenshot_ok=screenshot_exists(n),
             )
             html = _env.get_template("job_failed.html").render(
@@ -305,6 +309,7 @@ def render_email(n) -> tuple[str, str, str]:
                     ("Попыток", str(ctx["attempts"])),
                 ],
                 action=ctx["action"], job_url=ctx["job_url"],
+                vnc_url=ctx["vnc_url"],
                 screenshot_ok=ctx["screenshot_ok"])
             text = _env.get_template("job_failed.txt").render(**ctx)
             return subject, html, text
@@ -362,8 +367,12 @@ def render_email(n) -> tuple[str, str, str]:
             if data.get("job_id"):
                 rows.append(("Задача", str(data.get("job_id"))))
             html = _env.get_template("alert.html").render(
-                message=message, rows=rows, job_url=data.get("job_url") or "")
-            return subject, html, f"{title}\n\n{message}\n"
+                message=message, rows=rows, job_url=data.get("job_url") or "",
+                vnc_url=data.get("vnc_url") or "")
+            text = f"{title}\n\n{message}\n"
+            if data.get("vnc_url"):
+                text += f"Экран совещания (noVNC): {data['vnc_url']}\n"
+            return subject, html, text
         if kind == "digest":
             items = data.get("items") or []
             if items:

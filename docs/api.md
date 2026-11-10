@@ -497,7 +497,10 @@ maintenance по истечении `REVIEW_TIMEOUT_HOURS`; `mixed` — все �
 в Zoom (`join_stuck:<job_id>` — кнопка входа недоступна, один раз на встречу,
 в письме порт noVNC). Отправка только если `alert` входит в `NOTIFY_EVENTS`
 (входит по умолчанию, как и `confirm_end`).
-Тело: `{"subject": "...", "body": "...", "dedup_key": "alert"}`
+Тело: `{"subject": "...", "body": "...", "dedup_key": "alert", "job_id": <int|null>}`.
+С `job_id` письмо получает тему/ссылку на задачу и кликабельную кнопку
+«Посмотреть экран совещания (noVNC)», если экранный слот встречи ещё жив
+(`ready`/`running` в `mnema:vnc_sessions`); без живой сессии — письмо без ссылки.
 Ответ: `{"queued": <notification_id|null>}`
 
 ---

@@ -28,6 +28,7 @@ from sqlalchemy import select
 from .db import get_session
 from .models import Notification
 from .tz import app_tz_label, fmt_local
+from . import vnc as vnc_svc
 from .email_render import RECOMMENDED_ACTION, action_ru, reason_ru, render_email
 
 log = logging.getLogger("mnema.notify")
@@ -101,13 +102,16 @@ def build_job_failed_body(*, topic: str, meeting_id: str, job_id: int,
 def job_failed_data(*, job_id: int, topic: str, meeting_id: str,
                     fail_reason: str, attempts: int,
                     attempted_at: dt.datetime | None,
-                    job_url: str) -> dict:
-    return {
+                    job_url: str, vnc_url: str | None = None) -> dict:
+    data = {
         "job_id": job_id, "topic": topic, "meeting_id": meeting_id,
         "fail_reason": fail_reason, "attempts": attempts,
         "attempted_at": (attempted_at or dt.datetime.now(dt.timezone.utc)).isoformat(),
         "job_url": job_url,
     }
+    if vnc_url:
+        data["vnc_url"] = vnc_url
+    return data
 
 
 class NotifyService:
@@ -127,9 +131,15 @@ class NotifyService:
         now = dt.datetime.now(dt.timezone.utc)
         cooldown_min = int(env("ALERT_COOLDOWN_MIN", "60") or 60)
         job_url = f"{self.base_url}/jobs/{job_id}"
+        vnc_url = vnc_svc.email_link(job_id, self.base_url)
+        # FT: nuzhno vmeshatel'stvo cheloveka — ssylka na zhivoy ekrannyy slot;
+        # pri protuhshem vkhode (sessiya vstrechi uzhe osvobozhdena) — na setup-ekran
+        if not vnc_url and fail_reason == "auth_session_missing":
+            vnc_url = vnc_svc.setup_email_link(self.base_url)
         data = job_failed_data(job_id=job_id, topic=topic, meeting_id=meeting_id,
                                fail_reason=fail_reason, attempts=attempts,
-                               attempted_at=attempted_at, job_url=job_url)
+                               attempted_at=attempted_at, job_url=job_url,
+                               vnc_url=vnc_url)
         shot = safe_screenshot_path(screenshot_path)
         with get_session() as s:
             prev = s.scalars(select(Notification).where(

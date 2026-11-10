@@ -71,6 +71,36 @@ def get_for_job(job_id: int) -> dict | None:
     return get_session(f"job-{job_id}")
 
 
+LIVE_STATUSES = ("ready", "running")
+
+
+def host_from_base_url(base_url: str | None) -> str:
+    """Хост из http(s)://host:port/... (для писем: внешний хост noVNC)."""
+    host = (base_url or "").split("//", 1)[-1].split("/", 1)[0]
+    host = host.rsplit(":", 1)[0] if ":" in host.split("@")[-1] else host
+    return host or "localhost"
+
+
+def email_link(job_id: int, base_url: str | None = None) -> str | None:
+    """noVNC-ссылка для письма: только на живую сессию встречи (ready/running);
+    нет сессии / redis недоступен -> None (письмо уходит без ссылки)."""
+    sess = get_for_job(job_id)
+    if not sess or sess.get("status") not in LIVE_STATUSES:
+        return None
+    port = sess.get("public_port") or (public_port_base() + int(sess.get("slot") or 0))
+    return f"http://{host_from_base_url(base_url)}:{port}/vnc.html"
+
+
+def setup_email_link(base_url: str | None = None) -> str | None:
+    """Ссылка на setup-экран (перелогин Zoom-сессии) — для auth_session_missing,
+    где сессия встречи к моменту письма уже освобождена."""
+    sess = get_setup()
+    if not sess or sess.get("status") not in LIVE_STATUSES:
+        return None
+    port = sess.get("public_port") or public_port_base()
+    return f"http://{host_from_base_url(base_url)}:{port}/vnc.html"
+
+
 def send_command(action: str, job_id: int | None = None) -> bool:
     """Postavit' komandu menedzheru VNC v redis-list. False esli redis niedostupen."""
     try:

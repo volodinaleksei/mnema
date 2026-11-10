@@ -299,3 +299,92 @@ def test_job_detail_no_vnc_for_upload(client):
         s.commit()
     html = client.get(f"/jobs/{jid}").text
     assert "Экран встречи (VNC)" not in html
+
+
+# ----------------------------------------------------- ssylka noVNC v pish'mah
+def test_email_link_live_session(monkeypatch):
+    fake = FakeRedis({VNC_HASH: {"job-9": _entry(job_id=9, slot=4)}})
+    monkeypatch.setattr(vnc_svc, "_client", lambda timeout=1.0: fake)
+    monkeypatch.delenv("VNC_PUBLIC_PORT_BASE", raising=False)
+    assert vnc_svc.email_link(9, "http://mnema.example:8000") == \
+        "http://mnema.example:8084/vnc.html"
+
+
+def test_email_link_dead_session_or_no_redis_is_none(monkeypatch):
+    fake = FakeRedis({VNC_HASH: {"job-9": _entry(job_id=9, slot=1, status="failed")}})
+    monkeypatch.setattr(vnc_svc, "_client", lambda timeout=1.0: fake)
+    assert vnc_svc.email_link(9, "http://h:8000") is None
+    monkeypatch.setattr(vnc_svc, "_client", _raise_conn_error)
+    assert vnc_svc.email_link(9, "http://h:8000") is None
+
+
+def test_email_link_public_port_from_hash_wins(monkeypatch):
+    fake = FakeRedis({VNC_HASH: {"job-9": _entry(job_id=9, slot=1, public_port=7777)}})
+    monkeypatch.setattr(vnc_svc, "_client", lambda timeout=1.0: fake)
+    assert vnc_svc.email_link(9, "http://h:8000") == "http://h:7777/vnc.html"
+
+
+def test_host_from_base_url_variants():
+    assert vnc_svc.host_from_base_url("http://mnema.local:8000") == "mnema.local"
+    assert vnc_svc.host_from_base_url("https://mnema.local") == "mnema.local"
+    assert vnc_svc.host_from_base_url("") == "localhost"
+    assert vnc_svc.host_from_base_url(None) == "localhost"
+
+
+def test_setup_email_link_only_when_setup_alive(monkeypatch):
+    alive = json.dumps({"kind": "setup", "slot": 0, "public_port": 8080,
+                        "status": "running"})
+    fake = FakeRedis({VNC_HASH: {"setup": alive}})
+    monkeypatch.setattr(vnc_svc, "_client", lambda timeout=1.0: fake)
+    assert vnc_svc.setup_email_link("http://h:8000") == "http://h:8080/vnc.html"
+    dead = json.dumps({"kind": "setup", "slot": 0, "public_port": 8080,
+                       "status": "failed"})
+    fake2 = FakeRedis({VNC_HASH: {"setup": dead}})
+    monkeypatch.setattr(vnc_svc, "_client", lambda timeout=1.0: fake2)
+    assert vnc_svc.setup_email_link("http://h:8000") is None
+
+
+# ------------------------------------------------------------ /api/alert+job_id
+def test_api_alert_with_job_id_embeds_job_and_vnc_link(client, monkeypatch):
+    from mnema.core.db import get_session
+    from mnema.core.models import Notification
+    jid = client.post("/api/jobs", json={
+        "meeting_id": "123456789", "topic": "Капча-тест"}).json()["id"]
+    fake = FakeRedis({VNC_HASH: {f"job-{jid}": _entry(job_id=jid, slot=3)}})
+    monkeypatch.setattr(vnc_svc, "_client", lambda timeout=1.0: fake)
+    r = client.post("/api/alert", json={
+        "subject": "reCAPTCHA pri vhode", "body": "nuzhen ruchnoy protkhod",
+        "dedup_key": "captcha", "job_id": jid})
+    assert r.status_code == 200
+    nid = r.json()["queued"]
+    with get_session() as s:
+        n = s.get(Notification, nid)
+        data = json.loads(n.data_json)
+    assert data["job_id"] == jid and data["topic"] == "Капча-тест"
+    assert data["vnc_url"].endswith(":8083/vnc.html")
+
+
+def test_api_alert_without_job_id_unchanged(client):
+    r = client.post("/api/alert", json={"subject": "S", "body": "B"})
+    assert r.status_code == 200
+    from mnema.core.db import get_session
+    from mnema.core.models import Notification
+    with get_session() as s:
+        n = s.get(Notification, r.json()["queued"])
+        data = json.loads(n.data_json)
+    assert "job_id" not in data and "vnc_url" not in data
+
+
+def test_api_alert_unknown_job_id_no_vnc(client, monkeypatch):
+    fake = FakeRedis()
+    monkeypatch.setattr(vnc_svc, "_client", lambda timeout=1.0: fake)
+    r = client.post("/api/alert", json={
+        "subject": "S", "body": "B", "dedup_key": "alert:unknown",
+        "job_id": 987654})
+    assert r.status_code == 200
+    from mnema.core.db import get_session
+    from mnema.core.models import Notification
+    with get_session() as s:
+        n = s.get(Notification, r.json()["queued"])
+        data = json.loads(n.data_json)
+    assert "job_id" not in data and "vnc_url" not in data

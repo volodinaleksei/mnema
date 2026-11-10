@@ -509,7 +509,7 @@ async function joinMeeting(page, cfg, state, onEvent, jobId) {
       await fillNameAndJoin(page, cfg, onEvent, state);
       // reCAPTCHA: reshaet tol'ko chelovek (§12). Zhdём vruchnuyu prokhod
       // cherez noVNC (MAX CAPTCHA_WAIT_MIN), bez avtomatiki.
-      if (await waitForLeaveOrCaptcha(page, deadlineMs, cfg, onEvent, state.vnc)) {
+      if (await waitForLeaveOrCaptcha(page, deadlineMs, cfg, onEvent, state.vnc, jobId)) {
         onEvent(EVENT.JOINED, "с пред-join экрана");
         return { ok: true };
       }
@@ -789,7 +789,7 @@ async function fillNameAndJoin(page, cfg, onEvent, state = {}) {
             ? `нужен ручной проход через noVNC :${publicVncPort(cfg, state.vnc.slot)} ` +
               "(или завершить встречу вручную). Автоматизация капчи запрещена (§12)."
             : "индивидуальный VNC-экран недоступен — запись пойдёт headless без входа."),
-          `join_stuck:${state.jobId}`);
+          `join_stuck:${state.jobId}`, state.jobId ?? null);
       }
     }
     // vybor audiomarshruta (esli wyskakhyvaet okno)
@@ -878,7 +878,7 @@ function captchaAlertAllowed() {
   captchaAlertTs = now;
   return true;
 }
-async function waitForLeaveOrCaptcha(page, deadlineMs, cfg, onEvent, vnc = null) {
+async function waitForLeaveOrCaptcha(page, deadlineMs, cfg, onEvent, vnc = null, jobId = null) {
   const waitMs = (cfg.captchaWaitMin || 15) * 60 * 1000;
   const capUntil = Math.min(deadlineMs, Date.now() + waitMs);
   let sawCaptcha = false;
@@ -902,7 +902,8 @@ async function waitForLeaveOrCaptcha(page, deadlineMs, cfg, onEvent, vnc = null)
           alertOperator("Бот в зале ожидания Zoom",
             "Бот попал в зал ожидания (waiting room) — хост не пускает. " +
             (vnc ? `Запустите его через noVNC :${publicVncPort(cfg, vnc.slot)} ` : "") +
-            "или отмените запись. Встреча не начнётся автоматически.");
+            "или отмените запись. Встреча не начнётся автоматически.",
+            "captcha", jobId);
       }
     } else if (v === "captcha") {
       if (!sawCaptcha) {
@@ -914,7 +915,8 @@ async function waitForLeaveOrCaptcha(page, deadlineMs, cfg, onEvent, vnc = null)
           if (captchaAlertAllowed()) {
             alertOperator("reCAPTCHA при входе в встречу",
               `Откройте noVNC :${portHint} (Connect) и пройдите капчу в окне Zoom. ` +
-              `Автоматизация капчи запрещена (§12).`);
+              `Автоматизация капчи запрещена (§12).`,
+              "captcha", jobId);
           }
         } else {
           // Slotov net: vstrecha pishetsya headless, okna s kapchoy NIгде — na
@@ -928,7 +930,8 @@ async function waitForLeaveOrCaptcha(page, deadlineMs, cfg, onEvent, vnc = null)
               "Встреча столкнулась с reCAPTCHA, но свободных VNC-слотов нет " +
               "(или не поднялся дисплей): запись идёт headless и продолжится " +
               "без успеха до истечения CAPTCHA_WAIT_MIN. Освободите слот / перезапустите " +
-              "web-bot и загрузите встречу заново. Автоматизация капчи запрещена (§12).");
+              "web-bot и загрузите встречу заново. Автоматизация капчи запрещена (§12).",
+              "captcha", jobId);
           }
         }
       }
@@ -1077,11 +1080,12 @@ async function muteMicrophone(page, onEvent) {
 
 // Pryamoy SMTP signal cherez api (ne blokuyushchiy): proshu otdeliti v pish'mo
 // cherez vnutrenniy endpoint, esli yest'; inache — console/notify ostanovitsya.
-function alertOperator(subject, body, dedupKey = "captcha") {
+function alertOperator(subject, body, dedupKey = "captcha", jobId = null) {
   const API = process.env.API_URL || "http://api:8000";
   fetch(`${API}/api/alert`, {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ subject, body, dedup_key: dedupKey }),
+    body: JSON.stringify({ subject, body, dedup_key: dedupKey,
+                           job_id: jobId ?? null }),
   }).catch((e) => log.error("alert post failed:", e.message));
 }
 

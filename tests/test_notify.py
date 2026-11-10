@@ -347,3 +347,88 @@ def test_no_pwd_anywhere_in_email(env_base, session):
     assert "pwd" not in n.subject and "pwd" not in n.body.lower()
     msg = ns.build_message(n)
     assert "pwd" not in msg.as_string().lower()
+
+
+# ------------------------------------------------- VNC-ssylka v pish'mah sboya
+
+
+class FakeVncRedis:
+    def __init__(self, data=None):
+        self.hashes = data or {}
+
+    def hgetall(self, key):
+        return dict(self.hashes.get(key, {}))
+
+
+def _vnc_entry(slot=1, status="running", public_port=None):
+    d = {"kind": "job", "job_id": 1, "slot": slot, "display": f":{99 + slot}",
+         "ws_port": 6080 + slot, "profile": "/data/zoom-profiles/job-1",
+         "status": status, "ts": "2026-11-10T00:00:00Z", "error": None}
+    if public_port is not None:
+        d["public_port"] = public_port
+    return json.dumps(d)
+
+
+def test_job_failed_includes_live_vnc_link(env_base, session, monkeypatch):
+    from mnema.core import vnc as vnc_svc
+    fake = FakeVncRedis({"mnema:vnc_sessions": {"job-1": _vnc_entry(slot=1)}})
+    monkeypatch.setattr(vnc_svc, "_client", lambda timeout=1.0: fake)
+    ns = NotifyService(sender=lambda m: None, base_url="http://mnema.example:8000")
+    n = ns.enqueue_job_failed(job_id=1, topic="T", meeting_id="111",
+                              fail_reason="timeout", attempts=1)
+    data = json.loads(n.data_json)
+    assert data["vnc_url"] == "http://mnema.example:8081/vnc.html"
+
+
+def test_job_failed_no_vnc_link_when_session_dead(env_base, session, monkeypatch):
+    from mnema.core import vnc as vnc_svc
+    fake = FakeVncRedis({"mnema:vnc_sessions": {
+        "job-1": _vnc_entry(slot=1, status="failed")}})
+    monkeypatch.setattr(vnc_svc, "_client", lambda timeout=1.0: fake)
+    ns = NotifyService(sender=lambda m: None)
+    n = ns.enqueue_job_failed(job_id=1, topic="T", meeting_id="111",
+                              fail_reason="timeout", attempts=1)
+    assert "vnc_url" not in json.loads(n.data_json)
+
+
+def test_job_failed_auth_missing_falls_back_to_setup_link(env_base, session,
+                                                          monkeypatch):
+    from mnema.core import vnc as vnc_svc
+    setup = json.dumps({"kind": "setup", "job_id": None, "slot": 0,
+                        "display": ":99", "ws_port": 6080,
+                        "profile": "/data/zoom-profile", "public_port": 8080,
+                        "status": "running", "ts": "2026-11-10T00:00:00Z"})
+    fake = FakeVncRedis({"mnema:vnc_sessions": {"setup": setup}})
+    monkeypatch.setattr(vnc_svc, "_client", lambda timeout=1.0: fake)
+    ns = NotifyService(sender=lambda m: None, base_url="http://mnema.example:8000")
+    n = ns.enqueue_job_failed(job_id=1, topic="T", meeting_id="111",
+                              fail_reason="auth_session_missing", attempts=1)
+    data = json.loads(n.data_json)
+    assert data["vnc_url"] == "http://mnema.example:8080/vnc.html"
+
+
+def test_job_failed_email_has_clickable_vnc_button(env_base, session, monkeypatch):
+    from mnema.core import vnc as vnc_svc
+    fake = FakeVncRedis({"mnema:vnc_sessions": {"job-1": _vnc_entry(slot=2)}})
+    monkeypatch.setattr(vnc_svc, "_client", lambda timeout=1.0: fake)
+    ns = NotifyService(sender=lambda m: None, base_url="http://mnema.example:8000")
+    n = ns.enqueue_job_failed(job_id=1, topic="T", meeting_id="111",
+                              fail_reason="waiting_room_stuck", attempts=1)
+    msg = ns.build_message(n)
+    html = _walk(msg, "text/html")[0].get_content()
+    text = _walk(msg, "text/plain")[0].get_content()
+    assert 'href="http://mnema.example:8082/vnc.html"' in html
+    assert "noVNC" in html
+    assert "http://mnema.example:8082/vnc.html" in text
+
+
+def test_job_failed_email_without_vnc_no_button(env_base, session, monkeypatch):
+    from mnema.core import vnc as vnc_svc
+    monkeypatch.setattr(vnc_svc, "_client",
+                        lambda timeout=1.0: FakeVncRedis())
+    ns = NotifyService(sender=lambda m: None)
+    n = ns.enqueue_job_failed(job_id=1, topic="T", meeting_id="111",
+                              fail_reason="timeout", attempts=1)
+    html = _walk(ns.build_message(n), "text/html")[0].get_content()
+    assert "noVNC" not in html
+    assert "vnc.html" not in html

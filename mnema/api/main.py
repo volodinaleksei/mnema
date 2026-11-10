@@ -633,15 +633,36 @@ class AlertIn(BaseModel):
     subject: str
     body: str
     dedup_key: str | None = "alert"
+    job_id: int | None = None
 
 
 @app.post("/api/alert")
-def api_alert(body: AlertIn):
-    """Vnutrenniy signal ot web-bot (napr. reCAPTCHA, §12) -> e-mail."""
+def api_alert(body: AlertIn, request: Request):
+    """Vnutrenniy signal ot web-bot (napr. reCAPTCHA, §12) -> e-mail.
+    S job_id pishem temu/ssylku na zadachu + klikabel'nuyu noVNC-ssylku,
+    yesli ekrannaya sessiya vstrechi eshche zhiva (nuzhno vmeshatel'stvo)."""
+    data: dict = {"message": body.body}
+    topic = None
+    if body.job_id is not None:
+        with get_session() as s:
+            j = s.get(Job, body.job_id)
+            if j is not None:
+                topic = j.topic
+                data["job_id"] = j.id
+                data["topic"] = j.topic
+        ns = NotifyService()
+        data["job_url"] = f"{ns.base_url}/jobs/{body.job_id}"
+        vnc_url = _vnc_payload(request, vnc_svc.get_for_job(body.job_id))
+        public_host = ns.base_url.split("//", 1)[-1].split(":", 1)[0]
+        if vnc_url and public_host and public_host not in ("localhost", "api"):
+            port = vnc_url.rsplit(":", 1)[-1].split("/", 1)[0]
+            vnc_url = f"http://{public_host}:{port}/vnc.html"
+        if vnc_url:
+            data["vnc_url"] = vnc_url
     n = NotifyService().enqueue("alert",
                                 f"[Mnema] {body.subject}", body.body,
                                 dedup_key=body.dedup_key or "alert",
-                                data={"message": body.body})
+                                data=data)
     NotifyService().dispatch_pending(limit=5)
     return {"queued": n.id if n else None}
 

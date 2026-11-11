@@ -958,7 +958,7 @@ def test_mixed_segment_stays_in_steno_with_two_voices_tag(client):
     p = tasks._job_paths(jid)
     tasks._write_steno(jid, p)
     steno = p["steno"].read_text(encoding="utf-8")
-    assert "чужой" in steno and "dva golosa v fragmente" in steno
+    assert "чужой" in steno and "[два голоса]" in steno
     with get_session() as s:
         segs = s.scalars(select(Segment).where(
             Segment.job_id == jid, Segment.excluded.is_(False)

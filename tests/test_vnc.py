@@ -388,3 +388,23 @@ def test_api_alert_unknown_job_id_no_vnc(client, monkeypatch):
         n = s.get(Notification, r.json()["queued"])
         data = json.loads(n.data_json)
     assert "job_id" not in data and "vnc_url" not in data
+
+
+# ------------------------------------------------- _externalize_vnc_url (helper)
+def test_externalize_vnc_url_rewrites_to_public_host():
+    from mnema.api.main import _externalize_vnc_url
+    got = _externalize_vnc_url("http://172.17.0.3:8083/vnc.html",
+                               "http://mnema.example.ru")
+    assert got == "http://mnema.example.ru:8083/vnc.html"
+
+
+def test_externalize_vnc_url_keeps_internal_hosts():
+    from mnema.api.main import _externalize_vnc_url
+    for base in ("http://localhost:8000", "http://api:8000", ""):
+        assert _externalize_vnc_url("http://x:8081/vnc.html", base) == \
+            "http://x:8081/vnc.html"
+
+
+def test_externalize_vnc_url_none_passthrough():
+    from mnema.api.main import _externalize_vnc_url
+    assert _externalize_vnc_url(None, "http://mnema.example.ru") is None

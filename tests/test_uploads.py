@@ -305,3 +305,46 @@ def test_upload_page_and_jobs_card_render(client):
     assert "Загрузить" in r.text
     r2 = client.get("/jobs")
     assert "Загрузить архивную запись совещания" in r2.text
+
+
+def test_chunk_creates_and_finalize_drops_upload_lock(client):
+    """FIX: lock-fayl serializatsii ne dolzhen kopitsya v uploads/ —
+    finalize (i so sboyom probe) schitaetsya terminal'nym i ubiraet ego."""
+    from mnema.core.uploads import _upload_lock_path
+    data = _wav_bytes(1.0)
+    uid = client.post("/api/uploads", json={"filename": "lk.wav", "topic": "T",
+                                            "bytes_total": len(data)}).json()["upload_id"]
+    client.post(f"/api/uploads/{uid}/chunk?offset=0", content=data)
+    assert _upload_lock_path(uid).exists()
+    r = client.post(f"/api/uploads/{uid}/finalize")
+    assert r.status_code in (200, 400)  # zavisit ot nalichiya ffprobe
+    assert not _upload_lock_path(uid).exists()
+
+
+def test_cancel_drops_upload_lock(client):
+    from mnema.core.uploads import _upload_lock_path
+    uid = client.post("/api/uploads", json={"filename": "clk.webm", "topic": "T",
+                                            "bytes_total": 100}).json()["upload_id"]
+    client.post(f"/api/uploads/{uid}/chunk?offset=0", content=b"x" * 40)
+    assert _upload_lock_path(uid).exists()
+    assert client.post(f"/api/uploads/{uid}/cancel").status_code == 200
+    assert not _upload_lock_path(uid).exists()
+
+
+def test_gc_stale_uploads_drops_upload_lock(client, monkeypatch):
+    from mnema.core.db import get_session
+    from mnema.core.models import Upload
+    from mnema.core.uploads import _upload_lock_path, gc_stale_uploads
+    uid = client.post("/api/uploads", json={"filename": "glk.mp4", "topic": "T",
+                                            "bytes_total": 100}).json()["upload_id"]
+    lock = _upload_lock_path(uid)
+    client.post(f"/api/uploads/{uid}/chunk?offset=0", content=b"z" * 10)
+    with get_session() as s:
+        up = s.get(Upload, uid)
+        import datetime as _dt
+        up.created_ts = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=48)
+        up.updated_ts = up.created_ts
+        s.commit()
+    assert lock.exists()
+    assert gc_stale_uploads(max_age_hours=24) == 1
+    assert not lock.exists()

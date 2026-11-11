@@ -21,13 +21,28 @@ from .db import get_session
 from .models import Job, SessionEvent, Upload
 
 
+def _upload_lock_path(upload_id: int) -> Path:
+    return _uploads_dir() / f".up{upload_id}.lock"
+
+
+def _drop_upload_lock(upload_id: int) -> None:
+    """Убрать lock-fayl po terminal'nomu statusu uploada. Nezavisimyy unlink
+    bezopasen: derzhatel staryh flockov dosidyvaet na svyom inode, a lyuboy
+    novyy append_chunk posle commita vidit terminal'nyy status i otvergaetsya
+    do obrashcheniya k loku."""
+    try:
+        _upload_lock_path(upload_id).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 @contextlib.contextmanager
 def _upload_lock(upload_id: int):
     """Kross-processnaya/interpotocnaya serializaciya dopisivaniya odnogo
     uploada: dva parallel'nyh POST s odnim offsetom ran'she prohodili provierku
     `eff != cur` oboe i portili fayl interleavannymi baytami. Derzhim LOCK_EX
     na sosednem lock-fayl ote chteniya bytes_received do commita."""
-    lock_path = _uploads_dir() / f".up{upload_id}.lock"
+    lock_path = _upload_lock_path(upload_id)
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -215,6 +230,7 @@ def finalize(upload_id: int) -> Job:
             up.status = "failed"
             up.error = "файл загрузки отсутствует"
             s.commit()
+        _drop_upload_lock(upload_id)
         raise ValueError("Файл загрузки отсутствует")
     if expected is not None and path.stat().st_size < expected:
         raise ValueError("Файл загружен не полностью")
@@ -228,6 +244,7 @@ def finalize(upload_id: int) -> Job:
             up.status = "failed"
             up.error = probe["error"]
             s.commit()
+            _drop_upload_lock(upload_id)
             raise ValueError(probe["error"] or "не удалось провести валидацию")
         duration = probe["duration_s"] or 0.0
         ext = path.suffix.lower()
@@ -259,6 +276,7 @@ def finalize(upload_id: int) -> Job:
     transition(job_id, "processing", event="upload_finished")
     from .queue import enqueue_job
     enqueue_job("asr", "mnema.worker.tasks.run_orchestrate", job_id)
+    _drop_upload_lock(upload_id)
     with get_session() as s:
         return s.get(Job, job_id)
 
@@ -275,6 +293,7 @@ def cancel_upload(upload_id: int) -> Job:
             up.error = "отменено оператором"
             Path(up.path).unlink(missing_ok=True)
             s.commit()
+            _drop_upload_lock(upload_id)
     from .pipeline import transition
     with get_session() as s:
         job = s.get(Job, job_id)
@@ -304,6 +323,7 @@ def gc_stale_uploads(max_age_hours: int = 24) -> int:
             up.error = "очищено по тайм-ауту загрузки"
             s.add(SessionEvent(job_id=up.job_id, event="upload_gc",
                                detail=str(up.filename)))
+            _drop_upload_lock(up.id)
             removed += 1
         s.commit()
     return removed

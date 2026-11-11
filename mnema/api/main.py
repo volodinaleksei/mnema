@@ -370,13 +370,9 @@ def api_job_confirm_end(jid: int, body: ConfirmEndIn, request: Request):
         shot = req.screenshot_path
     ns = NotifyService()
     vnc = vnc_svc.get_for_job(jid)
-    vnc_url = _vnc_payload(request, vnc)
     # v pis'me ssylka dolzhna byt' vneshney (operator otkryvaet ne iz docker-seti):
     # host bereimsya iz MNEMA_PUBLIC_URL, yesli on zadanyi
-    public_host = NotifyService().base_url.split("//", 1)[-1].split(":", 1)[0]
-    if vnc_url and public_host and public_host not in ("localhost", "api"):
-        port = vnc_url.rsplit(":", 1)[-1].split("/", 1)[0]
-        vnc_url = f"http://{public_host}:{port}/vnc.html"
+    vnc_url = _externalize_vnc_url(_vnc_payload(request, vnc), ns.base_url)
     ns.enqueue("confirm_end",
                f"[Mnema] Завершить запись? {topic or 'встреча без темы'}",
                f"Встреча: {topic or '(без темы)'}\n"
@@ -455,6 +451,19 @@ def _vnc_payload(request: Request, sess: dict | None) -> str | None:
     if not sess or sess.get("status") not in VNC_LIVE_STATUSES:
         return None
     return _vnc_url(request, sess.get("public_port", vnc_svc.public_port_base()))
+
+
+def _externalize_vnc_url(vnc_url: str | None, base_url: str) -> str | None:
+    """Perepisyvaet host ssylki noVNC na vneshniy (iz MNEMA_PUBLIC_URL):
+    ssylka v pis'me otkryvaetsya operatorom ne iz docker-seti. Vnutrenniy
+    host (localhost/api) — ne pishem, pust' ostayotsya kak yest'."""
+    if not vnc_url:
+        return None
+    public_host = base_url.split("//", 1)[-1].split(":", 1)[0]
+    if not public_host or public_host in ("localhost", "api"):
+        return vnc_url
+    port = vnc_url.rsplit(":", 1)[-1].split("/", 1)[0]
+    return f"http://{public_host}:{port}/vnc.html"
 
 
 @app.get("/api/vnc/sessions")
@@ -642,28 +651,23 @@ def api_alert(body: AlertIn, request: Request):
     S job_id pishem temu/ssylku na zadachu + klikabel'nuyu noVNC-ssylku,
     yesli ekrannaya sessiya vstrechi eshche zhiva (nuzhno vmeshatel'stvo)."""
     data: dict = {"message": body.body}
-    topic = None
+    ns = NotifyService()
     if body.job_id is not None:
         with get_session() as s:
             j = s.get(Job, body.job_id)
             if j is not None:
-                topic = j.topic
                 data["job_id"] = j.id
                 data["topic"] = j.topic
-        ns = NotifyService()
         data["job_url"] = f"{ns.base_url}/jobs/{body.job_id}"
-        vnc_url = _vnc_payload(request, vnc_svc.get_for_job(body.job_id))
-        public_host = ns.base_url.split("//", 1)[-1].split(":", 1)[0]
-        if vnc_url and public_host and public_host not in ("localhost", "api"):
-            port = vnc_url.rsplit(":", 1)[-1].split("/", 1)[0]
-            vnc_url = f"http://{public_host}:{port}/vnc.html"
+        vnc_url = _externalize_vnc_url(
+            _vnc_payload(request, vnc_svc.get_for_job(body.job_id)), ns.base_url)
         if vnc_url:
             data["vnc_url"] = vnc_url
-    n = NotifyService().enqueue("alert",
-                                f"[Mnema] {body.subject}", body.body,
-                                dedup_key=body.dedup_key or "alert",
-                                data=data)
-    NotifyService().dispatch_pending(limit=5)
+    n = ns.enqueue("alert",
+                   f"[Mnema] {body.subject}", body.body,
+                   dedup_key=body.dedup_key or "alert",
+                   data=data)
+    ns.dispatch_pending(limit=5)
     return {"queued": n.id if n else None}
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 
 from jinja2 import DictLoader, Environment
 from markupsafe import Markup
@@ -86,7 +87,21 @@ _MACROS = """
 {%- endmacro %}
 
 {% macro button(label, url, color='#2e6fd8') -%}
-{% if url %}<a href="{{ url }}" style="display:inline-block;background-color:{{ color }};color:#ffffff;font-size:14px;text-decoration:none;padding:10px 18px;border-radius:6px;margin:18px 10px 0 0;">{{ label }}</a>{% endif %}
+{% if url %}<a href="{{ url }}" style="display:inline-block;background-color:{{ color }};color:#ffffff;font-size:14px;font-weight:bold;text-decoration:none;padding:12px 22px;border-radius:6px;mso-padding-alt:0;" bgcolor="{{ color }}">{{ label }}</a>{% endif %}
+{%- endmacro %}
+
+{% macro button_row(items) -%}
+{% set shown = [] %}
+{% for it in items %}{% if it[1] %}{% set _ = shown.append(it) %}{% endif %}{% endfor %}
+{% if shown %}<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-top:24px;">
+<tr>
+{% for label, url, color in shown %}<td align="center" bgcolor="{{ color }}" style="border-radius:6px;">
+<!--[if mso]><a href="{{ url }}" style="text-decoration:none;"><![endif]-->
+<a href="{{ url }}" style="display:inline-block;background-color:{{ color }};color:#ffffff;font-family:Arial,Helvetica,sans-serif;font-size:14px;font-weight:bold;text-decoration:none;padding:12px 24px;border-radius:6px;mso-padding-alt:0;" bgcolor="{{ color }}">{{ label }}</a>
+<!--[if mso]></a><![endif]-->
+</td>{% if not loop.last %}<td style="width:12px;font-size:0;line-height:0;">&nbsp;</td>{% endif %}{% endfor %}
+</tr>
+</table>{% endif %}
 {%- endmacro %}
 """
 
@@ -124,12 +139,15 @@ meeting_id: {{ meeting_id }}
 """
 
 _PROTOCOL_READY_HTML = """
-{% from "_macros.html" import page, fields, button %}
+{% from "_macros.html" import page, fields, button_row %}
 {% call page('#27ae60', 'Протокол готов') %}
-<p style="margin:0 0 14px;">Mnema записала совещание и сформировала протокол.</p>
+<p style="margin:0 0 18px;">Mnema записала совещание и сформировала протокол.</p>
 {{ fields([('Встреча', topic)]) }}
-{{ button('Протокол', job_url) }}
-{{ button('Аудиозапись', audio_url, '#7f8c8d') }}
+{{ button_row([
+  ('Открыть протокол', protocol_url, '#27ae60'),
+  ('Скачать аудио', audio_url, '#5d7290'),
+  ('Задача в Mnema', job_url, '#2e6fd8')
+]) }}
 {% endcall %}
 """
 
@@ -314,12 +332,19 @@ def render_email(n) -> tuple[str, str, str]:
             text = _env.get_template("job_failed.txt").render(**ctx)
             return subject, html, text
         if kind == "protocol_ready":
+            job_url = data.get("job_url") or ""
+            protocol_url = data.get("protocol_url") or ""
+            if not protocol_url and data.get("protocol_id"):
+                base = re.sub(r"/jobs/\d+$", "", job_url)
+                protocol_url = f"{base}/protocols/{data['protocol_id']}"
+            protocol_url = protocol_url or job_url
             html = _env.get_template("protocol_ready.html").render(
                 topic=_topic(data),
-                job_url=data.get("job_url") or "",
+                job_url=job_url,
+                protocol_url=protocol_url,
                 audio_url=data.get("audio_url") or "")
             msg = (f"Встреча: {_topic(data)}\n"
-                   f"Протокол: {data.get('job_url') or '—'}")
+                   f"Протокол: {protocol_url or '—'}")
             if data.get("audio_url"):
                 msg += f"\nАудиозапись: {data['audio_url']}"
             text = _env.get_template("generic.txt").render(title="Протокол готов",

@@ -164,3 +164,28 @@ def test_transition_failed_notifies_with_data_and_screenshot(env, monkeypatch):
         data = json.loads(n.data_json)
         assert data["fail_reason"] == "timeout"
         assert data["job_id"] == job.id
+
+
+def test_transition_done_notifies_with_protocol_url(env, monkeypatch):
+    """Perekhod v done: knopka 'Protokol' sylaetsya na /protocols/{id}, ne na /jobs/."""
+    import json
+
+    monkeypatch.setenv("NOTIFY_EMAIL_TO", "ops@example.ru")
+    monkeypatch.setenv("MNEMA_PUBLIC_URL", "http://example.internal:8000")
+    from sqlalchemy import select
+    from mnema.core.db import get_session
+    from mnema.core.models import Notification, Protocol
+    from mnema.core.pipeline import transition
+
+    job = _mkjob()
+    with get_session() as s:
+        s.add(Protocol(job_id=job.id, json_data={"summary": "ok"}))
+        s.commit()
+        pid = s.scalars(select(Protocol).where(Protocol.job_id == job.id)).first().id
+    transition(job.id, "done")
+    with get_session() as s:
+        n = s.query(Notification).filter_by(kind="protocol_ready").one()
+        data = json.loads(n.data_json)
+        assert data["protocol_url"] == f"http://example.internal:8000/protocols/{pid}"
+        assert data["job_url"] == f"http://example.internal:8000/jobs/{job.id}"
+        assert f"http://example.internal:8000/protocols/{pid}" in n.body

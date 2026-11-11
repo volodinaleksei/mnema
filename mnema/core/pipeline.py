@@ -113,14 +113,18 @@ def _notify_protocol_ready(job_id: int) -> None:
         proto = s.scalars(select(Protocol).where(Protocol.job_id == job_id)).first()
         topic = job.topic
     audio = f"{ns.base_url}/api/protocols/{proto.id}/audio" if proto else None
+    protocol_url = (f"{ns.base_url}/protocols/{proto.id}" if proto
+                    else f"{ns.base_url}/jobs/{job_id}")
     ns.enqueue("protocol_ready",
                f"[Mnema] Протокол готов: {topic}",
                f"Встреча: {topic or '(без темы)'}\n"
-               f"Протокол: {ns.base_url}/jobs/{job_id}"
+               f"Протокол: {protocol_url}"
                + (f"\nАудиозапись: {audio}" if audio else ""),
                dedup_key=f"protocol_ready:{job_id}",
                data={"job_id": job_id, "topic": topic,
                      "job_url": f"{ns.base_url}/jobs/{job_id}",
+                     "protocol_url": protocol_url,
+                     "protocol_id": proto.id if proto else None,
                      "audio_url": audio})
 
 

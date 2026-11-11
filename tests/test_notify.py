@@ -320,9 +320,15 @@ def test_render_every_kind_has_russian_fields():
 
     _, html, text = render_email(N("protocol_ready", "[Mnema] Протокол готов: В",
                                    {"topic": "В", "job_url": "http://h/jobs/1",
+                                    "protocol_url": "http://h/protocols/33",
                                     "audio_url": "http://h/a"}))
-    assert "Протокол готов" in html and "Протокол" in html
+    assert "Протокол готов" in html and "Открыть протокол" in html
     assert "Протокол готов" in text
+    assert 'href="http://h/protocols/33"' in html
+    assert "http://h/protocols/33" in text
+    # кнопка «Протокол» ведёт на протокол, а не на задачу
+    proto_btn = html.split('Открыть протокол')[0].rsplit("<a href=", 1)[1]
+    assert "/protocols/33" in proto_btn and "/jobs/1" not in proto_btn
     _, html, text = render_email(N("awaiting_llm", "[Mnema] Стенограмма: В",
                                    {"topic": "В", "job_url": "http://h/jobs/2"}))
     assert "LLM" in html and "Стенограмма" in html and "Стенограмма" in text
@@ -338,6 +344,26 @@ def test_render_every_kind_has_russian_fields():
     _, html, text = render_email(N("weird_kind", "[Mnema] Что-то", {},
                                    body="текст тела"))
     assert "текст тела" in html and "Что-то" in text
+
+
+def test_protocol_ready_link_falls_back_without_protocol_url():
+    from mnema.core.email_render import render_email
+
+    class N:
+        def __init__(self, kind, subject, data):
+            self.kind, self.subject, self.body = kind, subject, ""
+            self.data_json = json.dumps(data, ensure_ascii=False)
+            self.screenshot_path = None
+
+    # старое уведомление без protocol_url, но с protocol_id -> ссылка на протокол
+    _, html, _ = render_email(N("protocol_ready", "s",
+                                {"job_url": "http://h/jobs/41",
+                                 "protocol_id": 33}))
+    assert 'href="http://h/protocols/33"' in html
+    # совсем старое без протокола -> фолбэк на задачу, без падения
+    _, html, _ = render_email(N("protocol_ready", "s",
+                                {"job_url": "http://h/jobs/41"}))
+    assert 'href="http://h/jobs/41"' in html
 
 
 def test_no_pwd_anywhere_in_email(env_base, session):

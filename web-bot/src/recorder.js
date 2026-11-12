@@ -6,7 +6,7 @@ import { chromium } from "playwright";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { buildJoinUrl } from "./config.js";
+import { buildJoinUrl, apiHeaders } from "./config.js";
 import { createLogger } from "./log.js";
 import { decideSilence, shouldAskConfirmEnd } from "./silence.js";
 import { segKey, MIN_SEGMENT_BYTES } from "./seg_key.js";
@@ -319,7 +319,7 @@ export async function launchAndRecord(jobId, cfg, holder, onEvent, vnc = null) {
           diskLowAlerted = true;
           onEvent(EVENT.ERROR, `свободно на томе записи ${Math.round(free / 1e6)} МБ (< ${Math.round(MIN_FREE_BYTES / 1e6)}) — запись вот-вот упадёт, освободите /data`);
           fetch(`${process.env.API_URL || "http://api:8000"}/api/alert`, {
-            method: "POST", headers: { "content-type": "application/json" },
+            method: "POST", headers: apiHeaders(),
             body: JSON.stringify({ subject: "Диск web-bot почти заполнен",
               body: `Осталось ${Math.round(free / 1e6)} МБ на томе /data. Запись встреч останавливается при переполнении — очистите архив задач.`,
               dedup_key: "disk_low" }),
@@ -552,7 +552,8 @@ function joinUrlFromMeta(cfg, meta) {
 async function fetchJobMeta(jobId) {
   const API = process.env.API_URL || "http://api:8000";
   try {
-    const r = await fetch(`${API}/api/jobs/${jobId}/join-info`);
+    const r = await fetch(`${API}/api/jobs/${jobId}/join-info`,
+      { headers: apiHeaders("") });
     if (!r.ok) return null;
     return await r.json(); // {meeting_id, pwd|null}
   } catch {
@@ -570,7 +571,7 @@ async function askConfirmEnd(page, cfg, state, onEvent, reason) {
   onEvent("confirm_end_requested", `${reason} — вопрос оператору (письмо)`);
   try {
     const r = await fetch(`${API}/api/jobs/${state.jobId}/confirm-end`, {
-      method: "POST", headers: { "content-type": "application/json" },
+      method: "POST", headers: apiHeaders(),
       body: JSON.stringify({ reason, screenshot_path: shot || null }),
     });
     if (!r.ok) {
@@ -1094,7 +1095,7 @@ async function muteMicrophone(page, onEvent) {
 function alertOperator(subject, body, dedupKey = "captcha", jobId = null) {
   const API = process.env.API_URL || "http://api:8000";
   fetch(`${API}/api/alert`, {
-    method: "POST", headers: { "content-type": "application/json" },
+    method: "POST", headers: apiHeaders(),
     body: JSON.stringify({ subject, body, dedup_key: dedupKey,
                            job_id: jobId ?? null }),
   }).catch((e) => log.error("alert post failed:", e.message));

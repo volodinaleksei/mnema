@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { launchAndRecord, healthCheckSession } from "./recorder.js";
 import { salvageFromDisk } from "./salvage.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, apiHeaders } from "./config.js";
 import { createLogger } from "./log.js";
 import {
   VNC_QUEUE, setVncDeps, handleVncCommand, ensureSetup, startHeartbeat,
@@ -314,7 +314,7 @@ async function apiPost(url, body) {
   for (let i = 0; i < API_RETRIES; i++) {
     try {
       const r = await fetch(url, {
-        method: "POST", headers: { "content-type": "application/json" },
+        method: "POST", headers: apiHeaders(),
         body: JSON.stringify(body),
       });
       if (r.ok) return { ok: true, status: r.status };

@@ -157,18 +157,32 @@ def digest_job() -> None:
 
 
 def maintenance_job() -> None:
-    from .pipeline import review_timeout_check, stalled_recording_watch
+    from .pipeline import (retention_purge, review_timeout_check,
+                           stalled_processing_watch, stalled_recording_watch)
     from .uploads import gc_stale_uploads
     review_timeout_check()
     try:
         stalled_recording_watch()
     except Exception:  # noqa: BLE001 — watchdog ne dolzhen lonit' maintenance
         pass
+    try:
+        stalled_processing_watch()
+    except Exception:  # noqa: BLE001 — P1-1: sweeper ne lonit maintenance
+        log.exception("stalled_processing_watch failed")
     NotifyService().dispatch_pending()
+    try:
+        from .jobs_launch import drain_pending_commands
+        drain_pending_commands()
+    except Exception:  # noqa: BLE001 — P3-18: fallback-kanal ne lonit maintenance
+        log.exception("drain_pending_commands failed")
     try:
         gc_stale_uploads()
     except Exception:  # noqa: BLE001 — GC ne dolzhen lonit' maintenance
         pass
+    try:
+        retention_purge()
+    except Exception:  # noqa: BLE001 — P2-6: retention ne lonit maintenance
+        log.exception("retention_purge failed")
     try:
         from .export import retry_pending_exports
         retry_pending_exports()
@@ -177,17 +191,35 @@ def maintenance_job() -> None:
 
 
 def import_ics(text: str) -> int:
+    """Import VEVENTov v Joby. P3-17: sobytiya s UID, kotoryy uzhe v BDD,
+    propuskayutsya (dedup) — poves' odin kalendar dva raza i ne poluchi
+    dubley. Bez UID (redkiy generators) — kak ran'she, sozdyaetsya."""
     from .jobs_api import create_job
+    from sqlalchemy import select as _select
+    from .models import Job
+    with get_session() as s:
+        known_uids = {u for (u,) in s.execute(
+            _select(Job.ics_uid).where(Job.ics_uid.is_not(None)))}
     count = 0
+    skipped = 0
     for ev in parse_ics(text):
+        uid = (ev.get("uid") or "").strip() or None
+        if uid and uid in known_uids:
+            skipped += 1
+            continue
         try:
-            create_job(meeting_id=ev["meeting_id"], pwd=ev["pwd"],
-                       topic=ev["topic"], start_at=ev["start_at"],
-                       duration_max_min=ev["duration_max_min"],
-                       created_by="ics")
+            job = create_job(meeting_id=ev["meeting_id"], pwd=ev["pwd"],
+                             topic=ev["topic"], start_at=ev["start_at"],
+                             duration_max_min=ev["duration_max_min"],
+                             created_by="ics", ics_uid=uid)
+            if uid:
+                known_uids.add(uid)
             count += 1
+            del job
         except Exception as e:  # noqa: BLE001 — propuskaem nekorrektnye sobytiya
             log.warning("ics: propushcheno sobytie %r (%s): %s",
                         ev.get("topic"), ev.get("uid"), e)
             continue
+    if skipped:
+        log.info("ics: propushcheno dubley po UID: %s", skipped)
     return count

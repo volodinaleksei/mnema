@@ -45,7 +45,12 @@ fi
 # tak zhe, kak aktivnyye zapisi; politika — scripts/deploy-guard-lib.sh,
 # edinstvennyy escape-hatch FORCE_DEPLOY=1.
 . "$REPO_DIR/scripts/deploy-guard-lib.sh"
-JOBS_JSON="$(curl -sf --max-time 10 "$API_CHECK_URL/api/jobs" || true)"
+# P1-4: esli na serve vklyuchen API_TOKEN, bez zagolovka /api/vozvraschaet 401
+# (neizvestnoye sostojanie). Peredaem token, yesli on izvesten lokal'no
+# (API_TOKEN v okruzhenii / deploy-gpu.local.env).
+CURL_AUTH=()
+if [ -n "${API_TOKEN:-}" ]; then CURL_AUTH=(-H "X-API-Key: $API_TOKEN"); fi
+JOBS_JSON="$(curl -sf --max-time 10 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$API_CHECK_URL/api/jobs" || true)"
 CHECK_SH="$REPO_DIR/scripts/check-active-jobs.sh"
 ACTIVE_LIST=""
 CHECK_RC=3
@@ -142,7 +147,13 @@ echo "    alembic upgrade head..."
 # berem iz working tree posle `reset --hard`. Politika ta zhe: aktivnyye ili
 # neizvestnoye — stop; FORCE_DEPLOY raskryt zdes' lokal'no v tekst heredoc.
 . "$DEST_DIR/scripts/deploy-guard-lib.sh"
-SRV_JSON="\$(curl -sf --max-time 10 localhost:8000/api/jobs || true)"
+# P1-4: token berem iz server'nogo .env (untracked), yesli on tam zadann
+SRV_TOKEN="\$(grep -E '^API_TOKEN=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r' || true)"
+if [ -n "\$SRV_TOKEN" ]; then
+    SRV_JSON="\$(curl -sf --max-time 10 -H "X-API-Key: \$SRV_TOKEN" localhost:8000/api/jobs || true)"
+else
+    SRV_JSON="\$(curl -sf --max-time 10 localhost:8000/api/jobs || true)"
+fi
 SRV_LIST=""
 SRV_RC=3
 if [ -n "\$SRV_JSON" ]; then

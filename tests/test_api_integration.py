@@ -40,7 +40,10 @@ def client(tmp_path, monkeypatch):
         yield c
 
 
-def test_health_shape(client):
+def test_health_shape(client, monkeypatch):
+    # P2-5: ne zavisim ot nalichiya real'nogo redis na poru REDIS_URL
+    import redis as _redis
+    monkeypatch.setattr(_redis.Redis, "ping", lambda self, *a, **k: True)
     r = client.get("/health")
     assert r.status_code == 200
     j = r.json()
@@ -48,6 +51,19 @@ def test_health_shape(client):
     assert j["capabilities"]["llm"]["state"] == "not_configured"
     assert j["capabilities"]["asr"]["state"] == "not_configured"
     assert "zoom_session" in j and "queue" in j
+
+
+def test_health_degraded_when_queue_down(client, monkeypatch):
+    # P2-5: defekt (redis lezhit) dolzhen byt' vidim monitoringu: 503/degraded
+    import redis as _redis
+
+    def boom(self, *a, **k):
+        raise _redis.exceptions.ConnectionError("down")
+    monkeypatch.setattr(_redis.Redis, "ping", boom)
+    r = client.get("/health")
+    assert r.status_code == 503
+    assert r.json()["status"] == "degraded"
+    assert r.json()["queue"] is False
 
 
 def test_create_job_from_invite_link(client):

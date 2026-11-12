@@ -82,13 +82,19 @@ def _free_bytes(path: Path) -> int | None:
 
 
 def _check_free_space(need: int | None) -> None:
-    """Pri izvestnom razmere — trebovat' free >= need. Bez razmera — tol'ko chto
-    disk ochiten (ne blokiruschem sozdanie vremennogo fayla zagruzki)."""
+    """Pri izvestnom razmere — trebovat' free >= need * UPLOAD_CONCURRENT_RESERVE.
+
+    P2-11: ran'she zapas schitalis' pod ODNU zagruzku; dva parallel'nyh
+    arhiva po 8 GB prohodili provierku oba i dobivali disk do nulya.
+    Bez razmera — tol'ko chto disk ochiten (ne blokiruschem sozdanie
+    vremennogo fayla zagruzki)."""
     if need is None:
         return
+    reserve = max(1, int(os.environ.get("UPLOAD_CONCURRENT_RESERVE", "2") or 2))
     free = _free_bytes(Path(os.environ.get("DATA_DIR", "/data")))
-    if free is not None and free < need:
-        raise ValueError("На диске мало свободного места для загрузки")
+    if free is not None and free < need * reserve:
+        raise ValueError("На диске мало свободного места для загрузки "
+                         "(с запасом на параллельные загрузки)")
 
 
 def sanitize_filename(filename: str | None) -> str:
@@ -275,7 +281,7 @@ def finalize(upload_id: int) -> Job:
         s.commit()
     transition(job_id, "processing", event="upload_finished")
     from .queue import enqueue_job
-    enqueue_job("asr", "mnema.worker.tasks.run_orchestrate", job_id)
+    enqueue_job("prep", "mnema.worker.tasks.run_orchestrate", job_id)
     _drop_upload_lock(upload_id)
     with get_session() as s:
         return s.get(Job, job_id)
@@ -304,12 +310,18 @@ def cancel_upload(upload_id: int) -> Job:
 
 
 def gc_stale_uploads(max_age_hours: int = 24) -> int:
-    """UDalenie osirotevshih chasnichyh zagruzok starshe N chasov (maintenance)."""
+    """UDalenie osirotevshih chasnichyh zagruzok starshe N chasov (maintenance).
+
+    P2-11: ran'she obraabalyvalsya tol'ko pending/uploading — osirdelevshie
+    tmp-fayly failed-uploadov (napr. probe ne proshel, klient brosil posle
+    otkaza) lezhali na diske do 8 GB kazhdyy. failed-zapisi: fail-puti v
+    finalize/cancel uzhe udalyayut fayl, no esli protsess umer mezhdu
+    pomietkoy i unlink — GC podberet. complete (dannie v jobs/<id>) ne trayut."""
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=max_age_hours)
     removed = 0
     with get_session() as s:
         rows = s.scalars(select(Upload).where(
-            Upload.status.in_(("pending", "uploading")))).all()
+            Upload.status.in_(("pending", "uploading", "failed")))).all()
         for up in rows:
             ts = up.updated_ts or up.created_ts
             if ts is None:
@@ -318,7 +330,23 @@ def gc_stale_uploads(max_age_hours: int = 24) -> int:
                 ts = ts.replace(tzinfo=dt.timezone.utc)
             if ts >= cutoff:
                 continue
-            Path(up.path).unlink(missing_ok=True)
+            removed_bytes = 0
+            try:
+                p = Path(up.path)
+                if p.exists():
+                    removed_bytes = p.stat().st_size
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if up.status == "failed":
+                # fail-puti mogut ne dohit' do unlink — dobiraem fayl, bez
+                # povtornoy pomietki statusa i bez dbley v zhurale
+                if removed_bytes:
+                    s.add(SessionEvent(job_id=up.job_id, event="upload_gc",
+                                       detail=f"failed tmp: {up.filename} "
+                                              f"({removed_bytes} Б)"))
+                    removed += 1
+                continue
             up.status = "failed"
             up.error = "очищено по тайм-ауту загрузки"
             s.add(SessionEvent(job_id=up.job_id, event="upload_gc",

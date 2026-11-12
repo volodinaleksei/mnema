@@ -12,6 +12,9 @@ services:
       - ARCHIVE_DIR=/data/archive
       - TZ=Europe/Moscow
       - APP_TZ=Europe/Moscow
+      # P2-7: `compose up` sam podnyimaet schyolku BDD (ran'she alembic zvalsya
+      # tol'ko iz deploy-heredoc; pryamoy `up` na serve ostavlyal "no such column")
+      - ALEMBIC_UPGRADE_ON_START=${ALEMBIC_UPGRADE_ON_START:-1}
       - EXPORT_DIR=${EXPORT_DIR:-}
       # vygruzka: obrezka tishiny po krayam kopii sharomy (0 - vykluchit')
       - EXPORT_TRIM_SILENCE=${EXPORT_TRIM_SILENCE:-1}
@@ -29,6 +32,10 @@ services:
       - "${EXPORT_HOST_DIR:-/dev/null-export-deactivated}:/export"
     ports:
       - "8000:8000"
+    # P3-16: potolki resursov (pustoe znachenie = bez limita). Eto CAP, ne
+    # rezervaciya: vysokoe znachenie bezopasno na malenkoy mashine.
+    mem_limit: ${API_MEM_LIMIT:-4g}
+    cpus: ${API_CPUS:-2}
     depends_on:
       redis:
         condition: service_healthy
@@ -82,6 +89,12 @@ services:
       - data:/data
       - hf-cache:/root/.cache/huggingface
       - "${EXPORT_HOST_DIR:-/dev/null-export-deactivated}:/export"
+    # P3-16: worker (torch/whisper/diar) — samyy zhestokiy po RAM. Limit
+    # shche vseh sluchaev dolzhen byt' >= razmera zagruzhaemyh modeloy + audio;
+    # na GPU-mashine 16g zapasno. Uvedichat': pri prevyshenii OOM-killer
+    # ub'yvet horse'a, nadzyatel (main.py) perezapustit.
+    mem_limit: ${WORKER_MEM_LIMIT:-16g}
+    cpus: ${WORKER_CPUS:-8}
     depends_on:
       redis:
         condition: service_healthy
@@ -110,6 +123,12 @@ services:
     volumes:
       - data:/data
       - ./templates:/app/templates:ro
+    # P3-16: N parallel'nyh Chromium (BOT_MAX_CONCURRENT, po umolch. 4).
+    # P1-4: ekrany noVNC bez vstraivannoy auth — pri nedoverennoy seti
+    # uzhite VNC_PUBLISH_BIND=127.0.0.1: + ssh-tunnel i/ili VNC_PASSWORD
+    # (sm. registry); API-ye perimetr zakryt API_TOKEN (middleware v main.py).
+    mem_limit: ${RECORD_MEM_LIMIT:-4g}
+    cpus: ${RECORD_CPUS:-4}
     ports:
       # noVNC: 8080 = ekran nastroyki (setup), 8080+slot = ekrany vstrech;
       # vnutrennie 6080+slot (VNC_MAX_SLOTS po umolch. 20 -> diapazon 8080-8100).

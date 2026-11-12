@@ -40,7 +40,7 @@ class FakeRedis:
         self.pushes = []
 
     @classmethod
-    def from_url(cls, url):
+    def from_url(cls, url, **kwargs):
         return cls._inst
 
     def lpush(self, key, payload):
@@ -185,6 +185,7 @@ def test_enqueue_launch_future_gate_runs_at_push(db, fake_redis, monkeypatch):
     class FakeScheduler:
         def add_job(self, fn, **kw):
             scheduled["fn"] = fn
+            scheduled["kw"] = kw
 
     monkeypatch.setattr("mnema.core.scheduler.get_scheduler", lambda: FakeScheduler())
     _mk_job("111", "recording")
@@ -194,8 +195,9 @@ def test_enqueue_launch_future_gate_runs_at_push(db, fake_redis, monkeypatch):
     assert ok is True
     # v momentu planirovaniya push esche ne byl (otlozhennyj)
     assert fake_redis.pushes == []
-    # pri nastuplenii vremeni vyzyvaetsya _push — on gasit zapusk
-    scheduled["fn"]()
+    # pri nastuplenii vremeni vyzyvaetsya _push (s kwargs kak APScheduler) —
+    # on gasit zapusk
+    scheduled["fn"](**scheduled["kw"].get("kwargs", {}))
     assert [k for (k, _) in fake_redis.pushes
             if k == jobs_launch.LAUNCH_QUEUE_KEY] == []
     with get_session() as s:

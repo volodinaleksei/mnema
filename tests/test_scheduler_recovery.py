@@ -107,7 +107,7 @@ def test_enqueue_launch_past_goes_to_redis(monkeypatch):
         pushes: list[tuple[str, str]] = []
 
         @classmethod
-        def from_url(cls, url):
+        def from_url(cls, url, **kwargs):
             return cls()
 
         def lpush(self, key, payload):
@@ -186,7 +186,7 @@ def test_reschedule_end_to_end_past_job_pushes_launch(db, monkeypatch):
 
     class FakeRedis:
         @classmethod
-        def from_url(cls, url):
+        def from_url(cls, url, **kwargs):
             return cls()
 
         def lpush(self, key, payload):

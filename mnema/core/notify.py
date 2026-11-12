@@ -246,7 +246,12 @@ class NotifyService:
         return msg
 
     def dispatch_pending(self, limit: int = 20) -> int:
-        """Отдаёт письма-pending с retry/backoff (повторный вызов отлагает)."""
+        """Отдаёт письма-pending с retry/backoff (повторный вызов отлагает).
+
+        P2-9: limит popytok nastroyaem (NOTIFY_MAX_ATTEMPTS); posle nego pismo
+        v status='error' no ne «навсегда» — operator mozhet verdict' v pending
+        (obnovlenie) i maintenance povtorit."""
+        max_attempts = int(os.environ.get("NOTIFY_MAX_ATTEMPTS", "5") or 5)
         sent = 0
         with get_session() as s:
             rows = s.scalars(select(Notification).where(
@@ -260,7 +265,7 @@ class NotifyService:
                     row = s.get(Notification, n.id)
                     row.attempts += 1
                     row.last_error = str(e)[:2000]
-                    if row.attempts >= 5:
+                    if row.attempts >= max_attempts:
                         row.status = "error"
                     s.commit()
                 continue
@@ -272,6 +277,23 @@ class NotifyService:
                 s.commit()
             sent += 1
         return sent
+
+    def dispatch_pending_async(self, limit: int = 5) -> None:
+        """P2-9: SMTP v otdel'nom potoke, a ne vnutri HTTP-zaprosa. Ran'she
+        otkaz relay (тайmaut 30-60 s) derzhal worker uveta pri kazhdom
+        /api/alert i /confirm-end. Vozvrat srazu; pismo prioydet kogda prioydet
+        (maintenance_job vsyo ravno doshljuschet pending kazhdye 5 minut)."""
+        import threading
+        t = threading.Thread(target=self._safe_dispatch, args=(limit,),
+                             name="notify-dispatch", daemon=True)
+        t.start()
+
+    def _safe_dispatch(self, limit: int) -> None:
+        import logging
+        try:
+            self.dispatch_pending(limit=limit)
+        except Exception:  # noqa: BLE001 — fon ne lonitsa, no pishetsya
+            logging.getLogger("mnema.notify").exception("async dispatch failed")
 
     def build_digest(self) -> Notification | None:
         """FT-35v: пачка digest одним письмом; вызывается по ALERT_DIGEST_CRON."""

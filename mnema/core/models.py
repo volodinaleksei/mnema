@@ -53,6 +53,9 @@ class Job(Base):
                                                       nullable=True, index=True)
     # {boundaries: [{t, confidence, topic_before, topic_after}], model, skipped, ts}
     split_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # P3-17: UID события из импортированного .ics — дедуп повторных импортов
+    # одного и того же календаря (ICS-UID уникален в пределах календаря)
+    ics_uid: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
 
     events: Mapped[list["SessionEvent"]] = relationship(back_populates="job")
     audio_files: Mapped[list["AudioFile"]] = relationship(back_populates="job")
@@ -239,3 +242,21 @@ class Notification(Base):
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     sent_ts: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PendingCommand(Base):
+    """P3-18: fallback-kanal komand (stop/salvage) cherez BDD pri nedostupnom
+    redis. Zapisyvaetsya vmesto tishogo loss; maintenance_job (i start api)
+    povtaryayet push, kogda redis ozhil. Idempotentnost' na storone web-bot
+    (recorders/inFlight) ne pozvolyayet dublyam navredit'."""
+    __tablename__ = "pending_commands"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cmd: Mapped[str] = mapped_column(String(32), index=True)  # stop|salvage
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"), index=True)
+    reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending",
+                                        index=True)  # pending|pushed|expired
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    created_ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    pushed_ts: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

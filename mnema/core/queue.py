@@ -2,18 +2,38 @@
 from __future__ import annotations
 
 import os
+import time
 
 
 def redis_url() -> str:
     return os.environ.get("REDIS_URL", "redis://redis:6379/0").strip()
 
 
+# P2-13: kesh bez invalidacii "prikleival" direct-mode navsegda esli redis byl
+# nedostupen pri pervom zaprose (ili naoborot): zhivykh workerov ne bylo, a api
+# uzhe reshil chto my v direct. Keshiruem na korotkiy TTL (0 = keshi navsegda,
+# kak ran'she).
 _queues: dict[str, tuple] = {}
+_queues_ts: dict[str, float] = {}
+
+
+def _queues_ttl() -> float:
+    try:
+        return float(os.environ.get("QUEUE_CACHE_TTL_S", "30") or 30)
+    except ValueError:
+        return 30.0
+
+
+def reset_queue_cache() -> None:
+    _queues.clear()
+    _queues_ts.clear()
 
 
 def get_queue(name: str):
     """Vozvrachaet (queue, mode); mode='rq'|'direct'. V direct vzyvaetsya inline."""
-    if name in _queues:
+    ttl = _queues_ttl()
+    now = time.monotonic()
+    if name in _queues and (ttl <= 0 or now - _queues_ts.get(name, 0.0) < ttl):
         return _queues[name]
     try:
         from redis import Redis
@@ -24,6 +44,7 @@ def get_queue(name: str):
         _queues[name] = (q, "rq")
     except Exception:
         _queues[name] = (None, "direct")
+    _queues_ts[name] = now
     return _queues[name]
 
 

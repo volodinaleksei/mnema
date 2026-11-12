@@ -17,11 +17,20 @@ def create_job(*, meeting_link: str | None = None, meeting_id: str | None = None
                start_at: dt.datetime | None = None,
                end_at: dt.datetime | None = None,
                duration_max_min: int | None = None,
-               created_by: str = "api") -> Job:
+               created_by: str = "api",
+               ics_uid: str | None = None) -> Job:
     src = meeting_link or (meeting_id or "")
     if not src:
         raise ValueError("Нужен meeting_link или meeting_id")
     mid, extracted_pwd = extract_meeting_id(src)
+    if ics_uid:
+        # P3-17: povtornyy import odnogo kalendarya (odot ot /import-ics,
+        # perezapusk po raspisaniyu) ne dolzhen shtat' dubli — UID sobytiya
+        # unikalen v predelakh kalendarya.
+        with get_session() as s:
+            dup = s.scalars(select(Job).where(Job.ics_uid == ics_uid).limit(1)).first()
+            if dup is not None:
+                raise ValueError(f"vstrecha s UID {ics_uid} uzhe importirovana (job #{dup.id})")
     pwd = pwd or extracted_pwd
     join_link = normalize_join_link(meeting_link) if meeting_link else None
     if start_at is not None and start_at.tzinfo is None:
@@ -42,7 +51,7 @@ def create_job(*, meeting_link: str | None = None, meeting_id: str | None = None
                   topic=topic or f"Meeting {mid}", start_at=start_at,
                   end_at=end_at,
                   duration_max_min=duration_max_min, status=status,
-                  created_by=created_by)
+                  created_by=created_by, ics_uid=ics_uid)
         s.add(job)
         s.flush()
         s.add(SessionEvent(job_id=job.id, event="created",
@@ -209,6 +218,13 @@ def _purge_job(job_id: int) -> None:
         for rr in s.scalars(select(ReviewRequest).where(
                 ReviewRequest.job_id == job_id)).all():
             s.delete(rr)
+        from .models import ConfirmEndRequest, PendingCommand
+        for cer in s.scalars(select(ConfirmEndRequest).where(
+                ConfirmEndRequest.job_id == job_id)).all():
+            s.delete(cer)
+        for pc in s.scalars(select(PendingCommand).where(
+                PendingCommand.job_id == job_id)).all():
+            s.delete(pc)
         if proto:
             s.delete(proto)
         delete_pwd(job.pwd_ref)

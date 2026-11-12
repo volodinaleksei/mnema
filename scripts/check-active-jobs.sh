@@ -9,6 +9,8 @@
 # zhivoy brauzer, a `compose up -d --force-recreate web-bot` ubyet ego poserede
 # vstrechi (sluchay job 32: 06.11.2026 — 6,2 MB zapisi ostalis' bez protokola,
 # vstrecha propala).
+# P1-2: + processing — `--force-recreate worker` uryvaet ASR/Diarizatsiyu na GPU
+# posered konveyera; job zavisal v processing bez vosstanovleniya.
 set -euo pipefail
 
 src="${1:--}"
@@ -27,7 +29,7 @@ except Exception:
 if not isinstance(jobs, list):
     sys.exit(2)
 
-ACTIVE = {"launching", "recording", "uploading"}
+ACTIVE = {"launching", "recording", "uploading", "processing"}
 bad = [j for j in jobs if isinstance(j, dict) and j.get("status") in ACTIVE]
 for j in bad:
     print("  #{} {}: {} (start {})".format(

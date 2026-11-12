@@ -40,7 +40,20 @@ export function loadConfig() {
     // disk-gard: menshe etogo svobodnogo meste na tome /data -> alert, zapis'
     // prodolzhaetsya poka mozhet (dannye vazhne; chanki kopitsya v pamyati)
     minFreeDiskBytes: int(process.env.MIN_FREE_DISK_MB, 100) * 1_000_000,
+    // P1-4: esli na api vklyuchen API_TOKEN — peredavat' X-API-Key v kazhdom
+    // zaprose (status/finished/events/alert/join-info). Pusto = bez auth.
+    apiKey: process.env.API_TOKEN || "",
   };
+}
+
+// Zagolovki vseh HTTP-zaprosov k api (content-type + optional'nyy X-API-Key).
+// pustoy contentType (GET) — content-type ne stavimsya.
+export function apiHeaders(contentType = "application/json") {
+  const h = {};
+  if (contentType) h["content-type"] = contentType;
+  const key = process.env.API_TOKEN || "";
+  if (key) h["x-api-key"] = key;
+  return h;
 }
 
 function int(v, d) {

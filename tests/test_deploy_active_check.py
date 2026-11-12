@@ -54,10 +54,11 @@ def test_uploading_counts_as_active():
     assert res.returncode == 1
 
 
-def test_processing_is_not_active():
-    # processing idet na worker, brauzer web-bot uzhe zakryt — deploy dopustim
+def test_processing_counts_as_active():
+    # P1-2: deploy force-recreate'it worker — uryvayet ASR-na-GPU posered konveyera
     res = run_check("[%s,%s,%s]" % (job(7, "processing"), job(8, "awaiting_review"), job(9, "awaiting_llm")))
-    assert res.returncode == 0
+    assert res.returncode == 1
+    assert "#7 processing" in res.stdout
 
 
 def test_empty_list_returns_zero():

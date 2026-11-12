@@ -39,6 +39,33 @@ from ..core.tz import app_tz_label, fmt_local, local_to_utc, local_utc_offset, t
 log = setup_logging("api")
 
 
+def _alembic_upgrade_head() -> None:
+    """P2-7: migratsii pri zapuske api, a ne tol'ko v deploy-heredoc: `compose
+    up` na svyom meste ranshe ostavlyal schyolku v starey skheme ("no such
+    column" pri pervom zhe chtenii). Vkluchaetsya peremennoy
+    ALEMBIC_UPGRADE_ON_START=1 (stoit v compose dlya api; v testah vyklyucheno,
+    chtoby ne tyanut subprocess × 600 testov). Oshibka ne lonit start:
+    create_all i legacy-poryadok rabotayut kak ran'she."""
+    import subprocess
+    import sys
+    if os.environ.get("ALEMBIC_UPGRADE_ON_START", "0").strip() != "1":
+        return
+    root = Path(__file__).resolve().parents[2]
+    if not (root / "alembic.ini").exists():
+        return
+    try:
+        r = subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"],
+                           cwd=str(root), capture_output=True, text=True,
+                           timeout=180)
+        if r.returncode == 0:
+            log.info("alembic upgrade head: ok")
+        else:
+            log.error("alembic upgrade head rc=%s: %s",
+                      r.returncode, (r.stderr or r.stdout or "")[-500:])
+    except Exception:  # noqa: BLE001 — migratsii ne lonyat api (sm. vyche)
+        log.exception("alembic upgrade ne vypolnilsya")
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     errors = registry.preflight()
@@ -46,6 +73,7 @@ async def _lifespan(_app: FastAPI):
         for e in errors:
             log.error("preflight error: %s", e)
         raise SystemExit(1)
+    _alembic_upgrade_head()
     engine = get_engine()
     Base.metadata.create_all(engine)  # dlya SQLite-starta; dalneye Alembic
     try:
@@ -65,6 +93,59 @@ async def _lifespan(_app: FastAPI):
 app = FastAPI(title="Mnema", version="0.1.0", lifespan=_lifespan)
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+
+
+# ---------------------------------------------------------- P1-4: perimetr auth
+# API_TOKEN pust (default) — auth vykluchen. Kak tol'ko postavlen — vse marsh-
+# ruty trebuyut X-API-Key (ali Bearer, ali cookie mnema_token iz /auth/login).
+# Iz'yatiya: /health (compose-healthcheck ne znaet token), /static, /auth/
+# (sam vkhod), /confirm-end/ (samodostatochnyy unikal'nyy token v ssylke pis'ma).
+AUTH_EXEMPT_PREFIXES = ("/health", "/static/", "/auth/", "/confirm-end/")
+
+
+def _token_ok(request: Request) -> bool:
+    import secrets
+    token = os.environ.get("API_TOKEN", "").strip()
+    if not token:
+        return True
+    auth = request.headers.get("authorization", "")
+    supplied = (request.headers.get("x-api-key")
+                or (auth[7:] if auth.lower().startswith("bearer ") else "")
+                or request.cookies.get("mnema_token") or "").strip()
+    return bool(supplied) and secrets.compare_digest(supplied, token)
+
+
+@app.middleware("http")
+async def api_token_middleware(request: Request, call_next):
+    token_set = bool(os.environ.get("API_TOKEN", "").strip())
+    path = request.url.path
+    if token_set and not path.startswith(AUTH_EXEMPT_PREFIXES) \
+            and not _token_ok(request):
+        if path.startswith("/api/") or request.method != "GET":
+            return JSONResponse({"detail": "nedostupno: trebuetsya X-API-Key"},
+                                status_code=401)
+        # HTML-navigatsiya (GET) — na stranicu vhoda (stavit cookie odnim visitom)
+        return RedirectResponse("/auth/login", status_code=302)
+    return await call_next(request)
+
+
+@app.get("/auth/login", response_class=HTMLResponse)
+def auth_login(request: Request, token: str = ""):
+    """Odnostranichnyy vkhod operatora: proveryayet token, stavit cookie,
+    perenapravlyayet na nachal'nuyu. Tol'ko pri vklyuchennom API_TOKEN."""
+    if not os.environ.get("API_TOKEN", "").strip():
+        return RedirectResponse("/", status_code=302)
+    import secrets
+    expected = os.environ["API_TOKEN"].strip()
+    if not (token and secrets.compare_digest(token, expected)):
+        return HTMLResponse(
+            "<h3>Mnema: vkhod</h3><form method=get>"
+            "<input name=token type=password placeholder=token> "
+            "<button>Voyti</button></form>", status_code=401)
+    resp = RedirectResponse("/", status_code=302)
+    resp.set_cookie("mnema_token", expected, httponly=True, samesite="lax",
+                    max_age=30 * 24 * 3600)
+    return resp
 
 
 def human_size(n):
@@ -309,7 +390,7 @@ def api_job_finished(jid: int, body: FinishedIn):
                                       "возвращена в processing"))
             s.commit()
     from ..core.queue import enqueue_job
-    enqueue_job("asr", "mnema.worker.tasks.run_orchestrate", jid)
+    enqueue_job("prep", "mnema.worker.tasks.run_orchestrate", jid)
     return {"ok": True}
 
 
@@ -389,7 +470,7 @@ def api_job_confirm_end(jid: int, body: ConfirmEndIn, request: Request):
                      "vnc_url": vnc_url or "",
                      "job_url": f"{ns.base_url}/jobs/{jid}"},
                screenshot_path=shot)
-    ns.dispatch_pending(limit=5)
+    ns.dispatch_pending_async(limit=5)  # P2-9: SMTP vne HTTP
     return {"ok": True, "request_id": rid}
 
 
@@ -667,7 +748,7 @@ def api_alert(body: AlertIn, request: Request):
                    f"[Mnema] {body.subject}", body.body,
                    dedup_key=body.dedup_key or "alert",
                    data=data)
-    ns.dispatch_pending(limit=5)
+    ns.dispatch_pending_async(limit=5)  # P2-9: SMTP vne HTTP
     return {"queued": n.id if n else None}
 
 
@@ -1294,14 +1375,17 @@ def api_job_source(jid: int, request: Request = None):
 
 @app.get("/health")
 def health():
+    """P2-5: ran'she vsegda vozvrashal 200/"ok", daie kogda redis lezhal i
+    ochered' mertva — defekt byl nevidim monitoringu. Teper pri queue_ok=false
+    — 503 "degraded" (compose-healthcheck i monitoring vidyat). Vozmozhnosti
+    (llm/asr) v status ne vhodyat: oni capability, ne zavisimost zapuska."""
     caps = capability_status()
     session_ok = None
     with get_session() as s:
         h = s.scalars(select(SessionHealth).order_by(SessionHealth.checked_ts.desc())).first()
         if h:
             session_ok = {"ok": h.ok, "detail": h.detail, "checked_ts": h.checked_ts}
-        queue_ok = None
-    worker_up = None
+    queue_ok = None
     try:
         from redis import Redis
         from ..core.queue import redis_url
@@ -1312,14 +1396,18 @@ def health():
         queue_ok = False
     llm = caps["llm"]
     asr = caps["asr"]
-    return {
-        "status": "ok",
+    degraded = not queue_ok
+    payload = {
+        "status": "degraded" if degraded else "ok",
         "capabilities": {
             "llm": llm, "asr": asr,
         },
         "zoom_session": session_ok,
         "queue": queue_ok,
     }
+    if degraded:
+        return JSONResponse(payload, status_code=503)
+    return payload
 
 
 # ----------------------------------------------------------------- WEB (FT-22)

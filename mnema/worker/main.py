@@ -1,6 +1,13 @@
-"""RQ workera: roli asr/speaker/structure/archive (6.4).
+"""RQ workera: roli prep/asr/speaker/structure (6.4).
 
-WORKER_QUEUES=asr,speaker,structure,archive (po umolchaniyu vse).
+WORKER_QUEUES=prep,asr,speaker,structure (po umolchaniyu vse).
+
+P3-15: prep/VAD (run_orchestrate) vyneseny v otdel'nuyu ochered' prep:
+ran'she voshod konveyera (raspadovka+VAD, desyatki minut) stoyal v odnoy
+ocheredi s tyazhelym ASR i blokiroval ego (head-of-line), a dolgiy ASR
+derzhal slot i ostanavlival start novyh vstrech. 'prep' podklyuchaetsya
+vsegda, daie esli WORKER_QUEUES zadan vruchnuyu bez nego (inache jobi,
+zapisannye v prep v staroy konfiguracii, nikto ne chyital by).
 """
 from __future__ import annotations
 
@@ -44,9 +51,16 @@ def _start_heartbeat() -> None:
     threading.Thread(target=tick, name="worker-heartbeat", daemon=True).start()
 
 
-def run_worker() -> None:
+def _queue_names() -> list[str]:
     names = [q.strip() for q in os.environ.get(
-        "WORKER_QUEUES", "asr,speaker,structure").split(",") if q.strip()]
+        "WORKER_QUEUES", "prep,asr,speaker,structure").split(",") if q.strip()]
+    if "prep" not in names:  # P3-15: predohranenie ot starogo .env
+        names.append("prep")
+    return names
+
+
+def run_worker() -> None:
+    names = _queue_names()
     r = Redis.from_url(redis_url())
     conc = max(1, int(os.environ.get("WORKER_CONCURRENCY", "2") or 2))
     log.info("rq worker start: queues=%s procs=%s", names, conc)
@@ -116,7 +130,7 @@ def _start_scheduler(r, names: list[str]) -> None:
 def run_worker_sync() -> None:
     """Single-shot: otdelyt' po odnoy zadahe iz kazhdoi ocheredi (dlya testov)."""
     from rq import Queue, SimpleWorker
-    names = [q.strip() for q in os.environ.get("WORKER_QUEUES", "asr,speaker,structure").split(",") if q.strip()]
+    names = _queue_names()
     r = Redis.from_url(redis_url())
     queues = {n: Queue(n, connection=r) for n in names}
     done = 0
